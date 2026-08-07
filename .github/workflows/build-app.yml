@@ -1,0 +1,40 @@
+name: Build App
+
+on:
+  push:
+    branches:
+      - main
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    runs-on: macos-15
+
+    steps:
+      - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5.0.1
+
+      - name: Build (Release, universal, unsigned)
+        run: |
+          set -o pipefail
+          xcodebuild -project Spaceman.xcodeproj -scheme Spaceman -configuration Release \
+            -derivedDataPath DerivedData \
+            ONLY_ACTIVE_ARCH=NO \
+            CODE_SIGNING_ALLOWED=NO \
+            build
+
+      - name: Ad-hoc sign and verify
+        run: |
+          APP="DerivedData/Build/Products/Release/Spaceman.app"
+          codesign --force --deep --sign - "$APP"
+          codesign --verify --deep --strict "$APP"
+          lipo -archs "$APP/Contents/MacOS/Spaceman" | grep -q arm64
+          ditto -c -k --keepParent "$APP" Spaceman.zip
+
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: Spaceman-app
+          path: Spaceman.zip
+          if-no-files-found: error

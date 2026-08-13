@@ -158,6 +158,18 @@ class GestureSwitcher {
 
     // MARK: - Public API
 
+    /// Whether macOS allows this app to post synthetic events
+    /// (System Settings → Privacy & Security → Accessibility).
+    /// If not, ask the system to show its "Accessibility Access (Events)"
+    /// prompt — without the grant, posted gestures are silently dropped
+    /// and clicking a space appears to do nothing.
+    @discardableResult
+    static func ensurePostEventAccess() -> Bool {
+        if CGPreflightPostEventAccess() { return true }
+        CGRequestPostEventAccess()
+        return false
+    }
+
     /// Switch from the current space to the target space on the same display.
     /// Returns `false` if the spaces are on different displays (caller should
     /// fall back to AppleScript).
@@ -165,6 +177,7 @@ class GestureSwitcher {
         target: Space, current: Space, spaces: [Space],
         mode: SwitchingMode
     ) -> Bool {
+        Self.ensurePostEventAccess()
         guard target.displayID == current.displayID else { return false }
         guard !target.isCurrentSpace else { return true }
 
@@ -184,6 +197,7 @@ class GestureSwitcher {
 
     /// Switch one space left or right (for prev/next arrow buttons).
     func switchRelative(goRight: Bool, mode: SwitchingMode) {
+        Self.ensurePostEventAccess()
         let speed = mode == .instant ? Self.speedInstant : Self.speedFast
         performSwitchGesture(goRight: goRight, velocity: speed)
     }
@@ -225,8 +239,13 @@ struct SystemEventPoster: EventPosting {
     // MARK: - macOS Version Detection
 
     /// True if running macOS 27+, which requires IOHID payload augmentation.
+    /// `defaults write dev.ruittenb.Spaceman forceAugmentedGestures -bool true`
+    /// forces it on older versions, in case Apple backports the validation.
     private static let requiresAugmentation: Bool = {
-        ProcessInfo.processInfo.operatingSystemVersion.majorVersion >= 27
+        if UserDefaults.standard.bool(forKey: "forceAugmentedGestures") {
+            return true
+        }
+        return ProcessInfo.processInfo.operatingSystemVersion.majorVersion >= 27
     }()
 
     // MARK: - EventPosting

@@ -1,3 +1,4 @@
+1.24.1: Ask macOS for event-posting permission when gesture switching is used (fixes silent click-to-switch failure); add forceAugmentedGestures override
 1.24.0: Raised space name display limit from 10 to 30 characters; Sparkle feed now points to connerstobie fork
 1.23.6: Fix Fast Switching bug on macOS 27
 1.23.5: Fix RMB menu bug on macOS 27

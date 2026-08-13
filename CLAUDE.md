@@ -8,7 +8,7 @@ Spaceman is a macOS menu bar application that displays Spaces/Virtual Desktops. 
 
 ## Build Commands
 
-**NEVER build.** Do not run `make`, `xcodebuild`, or any other build commands. The user will build manually. Tell them to.
+**Never build the app locally** — no `make build/export/image`, no `xcodebuild` app builds. All app builds go through CI: `.github/workflows/build-app.yml` builds a Release universal app on every push to main (or manual dispatch) and uploads it as the `Spaceman-app` artifact (`Spaceman.zip`, ad-hoc signed). To install: `gh run download <run-id> -n Spaceman-app`, quit Spaceman, move the old `/Applications/Spaceman.app` to the Trash, unzip the new app into `/Applications`, relaunch. Running the test suite locally (see Testing) is fine.
 
 ## Build Artifacts
 

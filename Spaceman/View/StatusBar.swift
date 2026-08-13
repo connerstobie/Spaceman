@@ -6,6 +6,7 @@
 //
 
 import Foundation
+import os.log
 import Sparkle
 import SwiftUI
 
@@ -281,6 +282,9 @@ class StatusBar: NSObject, NSMenuDelegate, SPUUpdaterDelegate, SPUStandardUserDr
         return menuItem
     }
 
+    private static let clickLog = Logger(
+        subsystem: "dev.ruittenb.Spaceman", category: "click")
+
     @objc func handleClick(_ sbButton: NSStatusBarButton) {
         guard let event = NSApp.currentEvent else {
             return
@@ -331,6 +335,23 @@ class StatusBar: NSObject, NSMenuDelegate, SPUUpdaterDelegate, SPUStandardUserDr
                 let adjPoint = NSPoint(
                     x: locationInButton.x - self.imageHorizontalMargin(of: sbButton),
                     y: locationInButton.y)
+                let widths = self.iconCreator.iconWidths
+                    .map { "\($0.index):\(Int($0.left))..\(Int($0.right))" }
+                    .joined(separator: " ")
+                Self.clickLog.log("""
+                    click mouse=(\(Int(mouseLocation.x), privacy: .public),\
+                    \(Int(mouseLocation.y), privacy: .public)) \
+                    btnFrame=(\(Int(buttonFrame.minX), privacy: .public),\
+                    \(Int(buttonFrame.minY), privacy: .public),\
+                    \(Int(buttonFrame.width), privacy: .public)x\
+                    \(Int(buttonFrame.height), privacy: .public)) \
+                    winFrame=(\(Int(sbButton.window?.frame.minX ?? -1), privacy: .public),\
+                    \(Int(sbButton.window?.frame.width ?? -1), privacy: .public)) \
+                    adj=(\(Int(adjPoint.x), privacy: .public),\
+                    \(Int(adjPoint.y), privacy: .public)) \
+                    spaces=\(self.currentSpaces.count, privacy: .public) \
+                    widths=[\(widths, privacy: .public)]
+                    """)
                 self.spaceSwitcher.switchUsingLocation(
                     iconWidths: self.iconCreator.iconWidths,
                     point: adjPoint,

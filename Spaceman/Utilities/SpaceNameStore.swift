@@ -21,7 +21,7 @@ final class SpaceNameStore {
     private let key = "spaceNames"
     private let encoder = PropertyListEncoder()
     private let decoder = PropertyListDecoder()
-    private let queue = DispatchQueue(label: "dev.ruittenb.Spaceman.SpaceNameStore", attributes: .concurrent)
+    private let queue = DispatchQueue(label: "io.github.connerstobie.Spaceman.SpaceNameStore", attributes: .concurrent)
 
     init(defaults: UserDefaults = .standard) {
         self.defaults = defaults

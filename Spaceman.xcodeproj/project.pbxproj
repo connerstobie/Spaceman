@@ -629,7 +629,7 @@
 				CODE_SIGN_STYLE = Automatic;
 				GENERATE_INFOPLIST_FILE = YES;
 				MACOSX_DEPLOYMENT_TARGET = 13.0;
-				PRODUCT_BUNDLE_IDENTIFIER = dev.ruittenb.SpacemanTests;
+				PRODUCT_BUNDLE_IDENTIFIER = io.github.connerstobie.SpacemanTests;
 				PRODUCT_MODULE_NAME = SpacemanTests;
 				PRODUCT_NAME = SpacemanTests;
 				SWIFT_VERSION = 5.0;
@@ -645,7 +645,7 @@
 				CODE_SIGN_STYLE = Automatic;
 				GENERATE_INFOPLIST_FILE = YES;
 				MACOSX_DEPLOYMENT_TARGET = 13.0;
-				PRODUCT_BUNDLE_IDENTIFIER = dev.ruittenb.SpacemanTests;
+				PRODUCT_BUNDLE_IDENTIFIER = io.github.connerstobie.SpacemanTests;
 				PRODUCT_MODULE_NAME = SpacemanTests;
 				PRODUCT_NAME = SpacemanTests;
 				SWIFT_VERSION = 5.0;
@@ -809,8 +809,8 @@
 					"@executable_path/../Frameworks",
 				);
 				MACOSX_DEPLOYMENT_TARGET = 13.0;
-				MARKETING_VERSION = 1.24.2;
-				PRODUCT_BUNDLE_IDENTIFIER = dev.ruittenb.Spaceman;
+				MARKETING_VERSION = 1.25.0;
+				PRODUCT_BUNDLE_IDENTIFIER = io.github.connerstobie.Spaceman;
 				PRODUCT_NAME = "$(TARGET_NAME)";
 				PROVISIONING_PROFILE_SPECIFIER = "";
 				RUNTIME_EXCEPTION_DISABLE_LIBRARY_VALIDATION = YES;
@@ -846,8 +846,8 @@
 					"@executable_path/../Frameworks",
 				);
 				MACOSX_DEPLOYMENT_TARGET = 13.0;
-				MARKETING_VERSION = 1.24.2;
-				PRODUCT_BUNDLE_IDENTIFIER = dev.ruittenb.Spaceman;
+				MARKETING_VERSION = 1.25.0;
+				PRODUCT_BUNDLE_IDENTIFIER = io.github.connerstobie.Spaceman;
 				PRODUCT_NAME = "$(TARGET_NAME)";
 				PROVISIONING_PROFILE_SPECIFIER = "";
 				RUNTIME_EXCEPTION_DISABLE_LIBRARY_VALIDATION = YES;

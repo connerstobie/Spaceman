@@ -295,7 +295,7 @@ For details on how to make good use of 'refresh', see [MikeJL's Comments](README
 you may need to delete the application defaults:
 
 ```sh
-$ defaults delete dev.ruittenb.Spaceman
+$ defaults delete io.github.connerstobie.Spaceman
 ```
 
 - If Spaceman assigns the desktop names wrong:

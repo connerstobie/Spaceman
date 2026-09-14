@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 
 GITROOT=$(git rev-parse --show-toplevel)
-AUTHOR=ruittenb
+AUTHOR=connerstobie
 PROJECT=Spaceman
 PBXPROJ=$GITROOT/$PROJECT.xcodeproj/project.pbxproj
 BUILDDIR=build

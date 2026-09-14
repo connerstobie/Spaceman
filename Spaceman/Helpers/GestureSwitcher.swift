@@ -189,7 +189,7 @@ class GestureSwitcher {
             return true
         }
 
-        Logger(subsystem: "dev.ruittenb.Spaceman", category: "gesture").log("""
+        Logger(subsystem: "io.github.connerstobie.Spaceman", category: "gesture").log("""
             posting steps=\(calc.steps, privacy: .public) \
             right=\(calc.goRight, privacy: .public) \
             velocity=\(Int(calc.velocity), privacy: .public) \
@@ -246,7 +246,7 @@ struct SystemEventPoster: EventPosting {
     // MARK: - macOS Version Detection
 
     /// True if running macOS 27+, which requires IOHID payload augmentation.
-    /// `defaults write dev.ruittenb.Spaceman forceAugmentedGestures -bool true`
+    /// `defaults write io.github.connerstobie.Spaceman forceAugmentedGestures -bool true`
     /// forces it on older versions, in case Apple backports the validation.
     private static let requiresAugmentation: Bool = {
         if UserDefaults.standard.bool(forKey: "forceAugmentedGestures") {

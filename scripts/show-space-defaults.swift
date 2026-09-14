@@ -3,7 +3,7 @@
 import Foundation
 
 let defaults = UserDefaults.standard
-defaults.addSuite(named: "dev.ruittenb.Spaceman")
+defaults.addSuite(named: "io.github.connerstobie.Spaceman")
 
 struct SpaceNameInfo: Codable {
     let spaceNum: Int

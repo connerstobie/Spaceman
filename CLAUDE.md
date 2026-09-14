@@ -6,6 +6,8 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 Spaceman is a macOS menu bar application that displays Spaces/Virtual Desktops. Built with Swift and SwiftUI using Xcode (not SPM).
 
+This is Conner's fork of ruittenb/Spaceman. Since 1.25.0 it ships under its own bundle ID, `io.github.connerstobie.Spaceman`. Upstream's `dev.ruittenb.Spaceman` must not be reused: the upstream author asked for the split so users can tell the versions apart. Defaults, `tccutil`, and `log stream` all key on the new ID; `LegacyMigrations.migrateFromUpstreamBundleID()` copies settings from the old domain on first launch.
+
 ## Build Commands
 
 **Never build the app locally** — no `make build/export/image`, no `xcodebuild` app builds. All app builds go through CI: `.github/workflows/build-app.yml` builds a Release universal app on every push to main (or manual dispatch) and uploads it as the `Spaceman-app` artifact (`Spaceman.zip`, ad-hoc signed). To install: `gh run download <run-id> -n Spaceman-app`, quit Spaceman, move the old `/Applications/Spaceman.app` to the Trash, unzip the new app into `/Applications`, relaunch. Running the test suite locally (see Testing) is fine.

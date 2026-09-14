@@ -12,7 +12,7 @@ VERSION  = $(shell awk -F'["; ]*' '/MARKETING_VERSION/ { print $$3; exit }' $(PB
 IMAGE    = $(BUILDDIR)/$(PROJECT)-$(VERSION).dmg
 RCDIR    = ~/.spaceman
 AUTHOR   = ruittenb
-DOMAIN   = dev.$(AUTHOR).$(PROJECT)
+DOMAIN   = io.github.connerstobie.$(PROJECT)
 BREWDIR  = $(shell brew --repo $(AUTHOR)/tap)
 DATE    := $(shell date +"%Y-%m-%dT%H:%M:%S%z")
 

@@ -12,6 +12,7 @@ struct LegacyMigrations {
 
     /// Run all legacy UserDefaults migrations in order.
     static func perform() {
+        migrateFromUpstreamBundleID()
         removeObsoleteKeys()
         migrateSpaceByDesktopID()
         migrateHideInactiveSpaces()
@@ -196,6 +197,24 @@ struct LegacyMigrations {
             let mode = oldValue ? SwitchingMode.instant : SwitchingMode.smooth
             UserDefaults.standard.set(mode.rawValue, forKey: "switchingMode")
             UserDefaults.standard.removeObject(forKey: "useGestureSwitching")
+        }
+    }
+
+    /// Until 1.25.0 this fork shipped under the upstream bundle ID
+    /// (dev.ruittenb.Spaceman), so its settings live in that defaults domain.
+    /// Copy them once into this app's domain so users keep their space names,
+    /// colors and preferences after the bundle ID change.
+    private static func migrateFromUpstreamBundleID() {
+        let defaults = UserDefaults.standard
+        let marker = "migratedFromUpstreamBundleID"
+        guard !defaults.bool(forKey: marker) else { return }
+        defer { defaults.set(true, forKey: marker) }
+        guard defaults.object(forKey: "spaceNames") == nil,
+              let upstream = defaults.persistentDomain(forName: "dev.ruittenb.Spaceman"),
+              !upstream.isEmpty
+        else { return }
+        for (key, value) in upstream {
+            defaults.set(value, forKey: key)
         }
     }
 }

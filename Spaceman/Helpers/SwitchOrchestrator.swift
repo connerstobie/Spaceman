@@ -140,7 +140,7 @@ class SwitchOrchestrator {
             }
         }
         let clickLog = Logger(
-            subsystem: "dev.ruittenb.Spaceman", category: "click")
+            subsystem: "io.github.connerstobie.Spaceman", category: "click")
         clickLog.log("""
             hitTest point=(\(Int(point.x), privacy: .public),\
             \(Int(point.y), privacy: .public)) \

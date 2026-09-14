@@ -16,7 +16,7 @@ struct Constants {
         static let appVersion = Bundle.main.infoDictionary?["CFBundleShortVersionString"] as? String
         static let repo = URL(string: "https://github.com/ruittenb/Spaceman")!
         // swiftlint:disable:next force_unwrapping
-        static let website = URL(string: "https://ruittenb.github.io/Spaceman/?" + compilationDate())!
+        static let website = URL(string: "https://connerstobie.github.io/Spaceman/?" + compilationDate())!
     }
 
     //  23   = 277 px ; button distance

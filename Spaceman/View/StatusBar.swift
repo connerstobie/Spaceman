@@ -283,7 +283,7 @@ class StatusBar: NSObject, NSMenuDelegate, SPUUpdaterDelegate, SPUStandardUserDr
     }
 
     private static let clickLog = Logger(
-        subsystem: "dev.ruittenb.Spaceman", category: "click")
+        subsystem: "io.github.connerstobie.Spaceman", category: "click")
 
     @objc func handleClick(_ sbButton: NSStatusBarButton) {
         guard let event = NSApp.currentEvent else {

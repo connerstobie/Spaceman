@@ -198,7 +198,11 @@ class IconCreator {
         // 4. Calculate icon size (dynamic width based on text)
         let measureAttrs = getStringAttributes(alpha: 1, color: .black)
         let monoCharWidth = ("0" as NSString).size(withAttributes: measureAttrs).width
-        let padding = sizes.horizontalPadding * 2
+        // An undecorated space has no box to inset the text from, so it only
+        // needs half the padding. The gap between spaces still separates them.
+        let padding = decoration.isNoDecoration
+            ? sizes.horizontalPadding
+            : sizes.horizontalPadding * 2
 
         let contentWidth = text.length > 0
             ? text.size(withAttributes: measureAttrs).width

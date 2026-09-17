@@ -1,3 +1,4 @@
+1.28.0: Fit-to-width now measures the free menu bar space and picks the largest size that fits; undecorated spaces use tighter padding
 1.27.0: Removed the numbers-only and app-icon auto-shrink fallbacks; when the icon does not fit, the size steps down and names stay in full
 1.26.0: Two-row layout gains Extra Large (12pt) and Enormous (13pt) sizes for the taller menu bar of notched MacBooks
 1.25.0: Fork now uses its own bundle ID (io.github.connerstobie.Spaceman) at the upstream author's request; settings are migrated from the old domain on first launch

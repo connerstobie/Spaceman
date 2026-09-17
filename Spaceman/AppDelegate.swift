@@ -7,6 +7,7 @@
 
 import SwiftUI
 import KeyboardShortcuts
+import OSLog
 
 final class AppDelegate: NSObject, NSApplicationDelegate {
 
@@ -23,6 +24,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
 
     // Fit-to-width state
     private var fittedSize: IconSize?   // nil = the user's chosen size
+    private var budget: CGFloat?        // measured room for the icon, nil = unknown
+    private var lastIconWidth: CGFloat = 0
     private var lastSpaces: [Space] = []
     private var occlusionObserver: NSObjectProtocol?
     private var suppressOcclusionUntil: Date = .distantPast
@@ -181,21 +184,22 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
 
     // MARK: - Fit-to-width
     //
-    // When the status bar icon is too wide for the menu bar, macOS hides it
-    // (occlusion). Fit-to-width detects this and steps the icon size down
-    // (e.g. large -> medium -> compact -> narrow) until the icon fits again.
-    // Names are always rendered in full; the text style and row layout are
-    // never changed, and there is no numbers-only or app-icon fallback.
+    // The menu bar has a fixed amount of room to the left of the status item,
+    // and macOS simply hides an item that does not fit. Fit-to-width measures
+    // that room and renders the largest icon size that fits inside it, so the
+    // space names are always shown in full. The text style, row layout and
+    // names are never changed - only the size.
     //
-    // The fitted size is kept across space switches so the icon does not
-    // blink on every switch. It resets to the user's chosen size on topology
-    // changes, user refresh (settings change / manual refresh) and session
-    // activation, so the icon grows back when room becomes available.
+    // The budget is the distance from the right edge of our own status item
+    // to the left edge of the usable menu bar area (right of the notch on
+    // notched Macs). Items to our right keep their positions when our item
+    // changes width, so this measurement is stable.
     //
-    // Occlusion detection has two paths:
-    // 1. NSWindow.didChangeOcclusionStateNotification (primary)
-    // 2. A scheduled fallback check after each render, because the notification
-    //    may fire during the suppression window and get ignored.
+    // Occlusion is kept only as a backstop for the first render, before the
+    // status item window exists and a measurement is possible.
+
+    private static let fitLog = Logger(
+        subsystem: "io.github.connerstobie.Spaceman", category: "fit")
 
     /// The user's chosen icon size, read fresh from UserDefaults because
     /// @AppStorage on an NSObject does not observe writes from Preferences.
@@ -210,12 +214,25 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         return (RowLayout(rawValue: raw) ?? .singleRow).isTwoRows
     }
 
-    /// Renders the status bar icon at the fitted size, or the user's size.
+    /// The widest the icon may be before macOS hides the status item: the gap
+    /// between our item's right edge and the start of the usable menu bar.
+    /// Returns nil while the item is hidden or not yet placed, because the
+    /// window frame is only meaningful for a visible item.
+    private func measureBudget() -> CGFloat? {
+        guard let window = statusBar.statusBarWindow(),
+              statusBar.isIconVisible() else { return nil }
+        let screen = window.screen ?? NSScreen.main
+        guard let screen = screen else { return nil }
+        let leftBound = screen.auxiliaryTopRightArea?.minX ?? screen.frame.minX
+        let budget = window.frame.maxX - leftBound
+        return budget > 0 ? budget : nil
+    }
+
+    /// Renders the status bar icon at the largest size that fits the budget.
     private func renderIcon(for spaces: [Space]) {
-        // After setting a new image, macOS may briefly report the item as occluded.
-        let suppressDuration: TimeInterval = 1.0
-        let fallbackDelay: TimeInterval = suppressDuration + 0.1
-        suppressOcclusionUntil = Date().addingTimeInterval(suppressDuration)
+        // After setting a new image, macOS may briefly report the item as
+        // occluded. Only the first-render backstop consults occlusion.
+        suppressOcclusionUntil = Date().addingTimeInterval(1.0)
 
         // Filter to main display when enabled
         let displaySpaces: [Space]
@@ -226,19 +243,41 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             displaySpaces = spaces
         }
 
+        if let measured = measureBudget() { budget = measured }
+
         let buttonAppearance = statusBar.getButtonAppearance()
-        let icon = iconCreator.getIcon(for: displaySpaces, appearance: buttonAppearance,
-                                        sizeOverride: fittedSize)
+        // With a measured budget, start from the user's size every time so the
+        // icon grows back when room frees up. Without one, keep the size the
+        // occlusion backstop settled on.
+        var size = budget == nil ? (fittedSize ?? userIconSize) : userIconSize
+        var icon = iconCreator.getIcon(for: displaySpaces, appearance: buttonAppearance,
+                                        sizeOverride: size)
+
+        if let budget = budget {
+            while icon.size.width > budget,
+                  let smaller = size.nextSmaller(twoRows: isTwoRowLayout) {
+                size = smaller
+                icon = iconCreator.getIcon(for: displaySpaces, appearance: buttonAppearance,
+                                            sizeOverride: size)
+            }
+            Self.fitLog.log("""
+                fit: budget=\(Int(budget)) width=\(Int(icon.size.width)) \
+                size=\(size.rawValue) user=\(self.userIconSize.rawValue)
+                """)
+        }
+        fittedSize = size == userIconSize ? nil : size
+        lastIconWidth = icon.size.width
+
         statusBar.updateStatusBar(withIcon: icon, withSpaces: displaySpaces)
 
         if occlusionObserver == nil {
             setupOcclusionObserver()
         }
 
-        // Schedule a fallback occlusion check after the suppression window.
-        // The primary path (didChangeOcclusionStateNotification) may have fired
-        // during suppression and been ignored - this ensures we still react.
-        DispatchQueue.main.asyncAfter(deadline: .now() + fallbackDelay) { [weak self] in
+        // Re-check once the item has been laid out: on the first render no
+        // measurement was possible yet, and a measured budget can be too
+        // generous if another item sits to our left.
+        DispatchQueue.main.asyncAfter(deadline: .now() + 1.1) { [weak self] in
             self?.shrinkIfEvicted()
         }
     }
@@ -257,15 +296,25 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         }
     }
 
-    /// If the icon is occluded and we're not in the suppression window,
-    /// step down to the next smaller size and re-render. At the smallest
-    /// size there is nothing left to try.
+    /// Backstop: the item is hidden, so whatever we rendered was too wide.
+    /// Tighten the budget below that width and re-render, which picks the
+    /// largest size that fits underneath it. Never changes the text.
     private func shrinkIfEvicted() {
         guard !statusBar.isIconVisible(),
-              Date() >= suppressOcclusionUntil,
-              let smaller = (fittedSize ?? userIconSize).nextSmaller(twoRows: isTwoRowLayout)
-        else { return }
-        fittedSize = smaller
+              Date() >= suppressOcclusionUntil else { return }
+        let ceiling = lastIconWidth - 1
+        if let current = budget, current <= ceiling {
+            // Already budgeted below this width and still hidden: step the
+            // size down directly so we keep making progress.
+            guard let smaller = (fittedSize ?? userIconSize).nextSmaller(twoRows: isTwoRowLayout)
+            else { return }
+            fittedSize = smaller
+            budget = nil
+            Self.fitLog.log("evicted: stepping down to size=\(smaller.rawValue)")
+        } else {
+            budget = ceiling
+            Self.fitLog.log("evicted: budget tightened to \(Int(ceiling))")
+        }
         renderIcon(for: lastSpaces)
     }
 
@@ -304,12 +353,11 @@ extension AppDelegate: SpaceObserverDelegate {
         statusBar.reloadShortcuts()
         lastSpaces = spaces
 
-        // Try the user's chosen size again when the environment may have
-        // changed. Space switches and auto-refresh keep the fitted size so
-        // the icon does not blink; if it still doesn't fit, shrinkIfEvicted()
-        // steps it back down.
+        // Re-measure the available room when the environment may have
+        // changed, so the icon grows back if space freed up.
         if trigger.resetsFittedSize {
             fittedSize = nil
+            budget = nil
         }
 
         renderIcon(for: spaces)

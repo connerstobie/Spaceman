@@ -1,0 +1,35 @@
+{
+  "name": "devspaces-helper",
+  "displayName": "Devspaces Helper",
+  "description": "Opens folders in new windows, quits, or checks for updates when the local devspaces script asks, so new windows land on the macOS Space the script is showing.",
+  "version": "1.0.0",
+  "publisher": "connerstobie",
+  "license": "MIT",
+  "private": true,
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/connerstobie/Spaceman.git"
+  },
+  "engines": {
+    "vscode": "^1.90.0"
+  },
+  "categories": [
+    "Other"
+  ],
+  "os": [
+    "darwin"
+  ],
+  "extensionKind": [
+    "ui"
+  ],
+  "capabilities": {
+    "untrustedWorkspaces": {
+      "supported": true
+    },
+    "virtualWorkspaces": true
+  },
+  "activationEvents": [
+    "onStartupFinished"
+  ],
+  "main": "./extension.js"
+}

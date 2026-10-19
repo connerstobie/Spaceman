@@ -17,6 +17,22 @@
             <cocoa class="Spaceman.RestorePreferencesCommand" />
         </command>
 
+        <command name="switch to space" code="smsuswsp"
+                 description="Switch to a space by its name or number, or by its macOS space id">
+            <cocoa class="Spaceman.SwitchToSpaceCommand" />
+            <direct-parameter optional="yes"
+                              description="The space name, or its number as given by 'current space number'">
+                <type type="text"/>
+                <type type="integer"/>
+            </direct-parameter>
+            <parameter name="with space id" code="SpID" type="integer" optional="yes"
+                       description="The macOS ManagedSpaceID; it changes after a reboot or wake">
+                <cocoa key="spaceID"/>
+            </parameter>
+            <result type="boolean"
+                    description="true when the switch has started, or the space is already current"/>
+        </command>
+
         <class name="application" code="capp" description="The Spaceman application">
             <cocoa class="NSApplication"/>
             <property name="current space number" code="SpNo" type="integer" access="r"

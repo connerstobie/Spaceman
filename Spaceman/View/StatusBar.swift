@@ -956,6 +956,18 @@ class StatusBar: NSObject, NSMenuDelegate, SPUUpdaterDelegate, SPUStandardUserDr
         handleSwitchTag(sender.tag)
     }
 
+    /// Switch for the AppleScript "switch to space" command. Resolves the
+    /// target against the spaces the menu shows and builds the same tag the
+    /// menu item would carry, so both take the same strategy path.
+    func switchToSpace(matching target: SpaceTarget) -> SpaceTarget.Resolution {
+        let resolution = SpaceTarget.resolve(target, in: currentSpaces)
+        guard case .found(let space) = resolution, !space.isCurrentSpace else { return resolution }
+        let switchIndex = Space.buildSwitchIndexMap(for: currentSpaces)[space.spaceID]
+        let desktopNumber: Int? = if let switchIndex, switchIndex > 0 { switchIndex } else { nil }
+        handleSwitchTag(desktopNumber ?? -(space.spaceNumber))
+        return resolution
+    }
+
     private func handleSwitchTag(_ tag: Int) {
         let ctx = SwitchContext(
             entryPoint: .menu,

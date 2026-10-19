@@ -271,7 +271,14 @@ Spaceman supports AppleScript commands for remote control:
 $ osascript -e 'tell application "Spaceman" to refresh' # Refresh the Spaces Icon
 $ osascript -e 'tell application "Spaceman" to open preferences' # Open Preferences Window
 $ osascript -e 'tell application "Spaceman" to restore preferences' # Restore Preferences from Backup
+$ osascript -e 'tell application "Spaceman" to switch to space "Mail"' # Switch by name
+$ osascript -e 'tell application "Spaceman" to switch to space 3' # Switch by number
+$ osascript -e 'tell application "Spaceman" to switch to space with space id 6' # Switch by macOS ManagedSpaceID
 ```
+
+`switch to space` uses the same switching mode as clicking a space, returns `true` once the switch has
+started, and raises an error when no space (or more than one space) has that name. The switch finishes
+asynchronously, so a script that needs to act on the new space should poll `current space name`.
 
 It also exposes read-only properties that can be queried:
 
@@ -287,6 +294,29 @@ For `display count`, mirrored displays count as one.
 
 These commands and properties can be used in automation tools like Alfred, Keyboard Maestro, or custom scripts.
 For details on how to make good use of 'refresh', see [MikeJL's Comments](README-Yabai.md)
+
+## 🔹 Update Apps Without Losing Your Spaces (`devspaces/update`)
+
+Restarting VS Code or Chrome to apply an update reopens every window on one Space.
+`devspaces/update` updates Chrome, VS Code and the Claude Code extension, then puts each
+VS Code window back on the Space it came from, using `switch to space` above.
+
+```sh
+$ devspaces/update
+```
+
+One command, nothing to set up first: it builds or installs whatever it needs, shows what will
+update, asks once, then quits, updates and reopens. "Update" in Spotlight runs the same job.
+
+- **Why a helper extension:** the `code` command brings VS Code to the front before it makes a window,
+  and macOS then jumps to a Space that already has a VS Code window. A window opened from inside
+  VS Code lands on the Space being shown, so `update` switches Spaces and asks the helper to open each folder.
+- **Updates use each app's own updater:** Chrome's GoogleUpdater, VS Code's built-in updater, and
+  `code --install-extension --force` for Claude Code, only in the profiles of the windows being reopened.
+- **Each window's layout comes back:** VS Code restores a folder's editors (Claude Code tab, browser tab and its URL)
+  on its own; `update` also reopens DevTools on the browser tab that was in front, which VS Code does not save.
+- **Needs:** Spaceman 1.29.0 or later, Xcode command line tools (`swiftc`), Node (`npx`, to package the helper).
+- Logs go to `~/Library/Logs/devspaces/`, state to `~/Library/Application Support/devspaces/`.
 
 ## 🔹 Troubleshooting
 

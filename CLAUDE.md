@@ -195,6 +195,47 @@ The resolution logic lives in static methods so tests can call them without inst
 7. **The merge preserves entries with user data even on connected displays.** This is a safety net for when position matching fails to recover a name after an ID reassignment. The entry sticks around under the old key until its display+position slot is claimed by a new entry. Do not simplify the merge to only check `connectedDisplayIDs` without also considering `hasUserData`.
 8. **`findSpaceByPosition` with disconnected fallback is intentionally loose.** It matches any disconnected display at the same position. This is acceptable because it only triggers for display UUIDs with no stored entries, which means macOS gave the display a new identity.
 
+## devspaces/ — the `update` command (update apps, keep every window on its Space)
+
+Conner's `update` (bashrc alias) and the Spotlight app "Update" update Chrome, VS Code and the
+Claude Code extension, then reopen each VS Code window on its Spaceman Space. ONE command, no
+subcommands and no setup step, at Conner's explicit ask (19 Oct 2026: "one command ... simple");
+anything it needs is built or installed by that command itself. Do not add subcommands back.
+The repo is PUBLIC: nothing personal goes in `devspaces/` (no paths, repo names, URLs or Space names;
+the user's map lives in `~/Library/Application Support/devspaces/`).
+
+- **NEVER run `update` from a Claude session without asking.** It quits VS Code, which kills every
+  Claude session on the Mac, this one included. Its read-only functions (`take_snapshot`,
+  `plan_lines`, `editor_state`) are safe to call by importing the file.
+- **Why a helper extension (`devspaces/vscode-helper`), not the `code` command.** On macOS,
+  `LaunchMainService.start` calls `app.focus({steal: true})` before opening a window, and with
+  "switch to a Space with open windows for the application" on (the default) macOS jumps to a Space
+  that already has a VS Code window, so the new window opens there. `vscode.openFolder` with
+  `forceNewWindow` from inside VS Code only focuses the new window, which macOS creates on the active
+  Space. Do not "simplify" back to `code -n`; it is the bug this exists to avoid. Turning that
+  macOS setting off needs `killall Dock`, which is why it was not used.
+- **Protocol:** `update` writes `requests/<id>.json` (0700 dir); every window's helper sees it, one
+  claims it by atomic rename, answers in `responses/<id>.json`. Requests with a `folder` are only
+  claimed by that folder's window. Types: `open`, `devtools`, `check-update`, `quit`, `close` (folder-targeted).
+- **The work runs inside `~/Applications/Update.app`** (an osacompile applet that calls
+  `update --app`), so VS Code quitting cannot kill it and it has its own macOS permissions (Automation for
+  Spaceman and Chrome; Screen Recording only when started from Spotlight, for window titles).
+  `update` rebuilds it only when its source changes: a rebuild changes its signature and macOS
+  drops its permissions.
+- **Updates go through each app's own updater:** `GoogleUpdater --update-apps` (per user),
+  VS Code's Squirrel/ShipIt (asked via the helper's `update.checkForUpdate`, installed when VS Code
+  quits; `ShipItState.plist` is JSON), and `code --install-extension anthropic.claude-code --force
+  --profile <name>` only for profiles of the windows being reopened (never Work).
+- **Facts measured on Conner's Mac (macOS 26):** Chrome's AppleScript `version` reads the bundle on
+  disk, not the running build; the running build is in Chrome's `Last Version` file. BSD `pgrep`
+  skips its own ancestors, so `update` passes `-a` (VS Code is an ancestor when run in its terminal).
+  Window titles from `CGWindowListCopyWindowInfo` need Screen Recording for the responsible app.
+  VS Code's integrated browser saves only a tab's URL and title, so DevTools (and DevTools' device
+  mode) must be reopened with `workbench.action.browser.toggleDevTools` on the front browser tab.
+- **Unproven until the first real run:** whether Chrome's `--restore-last-session` puts windows back
+  on their Spaces on macOS 26 (Chromium reported the AppKit side broken on macOS 15.1, issue
+  373928194). `update` records Chrome windows per Space and reports any Space that lost its Chrome window.
+
 ## Ledger
 
 - **Click a space in the menu bar to switch to it** — asked 2026-08-12. Fixed same day (v1.24.1 permission request + v1.24.2 diagnostics; root cause: unsigned builds get per-binary TCC grants, needed a fresh manual Accessibility add for the installed binary). **Signed off by Conner 2026-08-12 ("it works").**

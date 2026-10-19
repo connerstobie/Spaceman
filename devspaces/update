@@ -1,0 +1,994 @@
+#!/usr/bin/python3
+"""update: update Chrome, VS Code and the Claude Code extension, then reopen every
+VS Code window on the Spaceman Space it came from. One command, no options needed.
+
+It builds or installs whatever it needs on its own (the spacectl helper, the VS Code
+helper extension, ~/Applications/Update.app), shows what will update, asks once, then
+hands the job to Update.app, which survives VS Code quitting and has its own macOS
+permissions. "Update" in Spotlight runs the same job.
+
+Logs: ~/Library/Logs/devspaces/. State: ~/Library/Application Support/devspaces/.
+Standard library only; runs on the system /usr/bin/python3 (3.9).
+"""
+
+import argparse
+import datetime
+import fcntl
+import hashlib
+import json
+import os
+import plistlib
+import re
+import shutil
+import sqlite3
+import subprocess
+import sys
+import tempfile
+import time
+import urllib.error
+import urllib.request
+import uuid
+import zipfile
+from pathlib import Path
+
+HOME = Path.home()
+REPO = Path(__file__).resolve().parent
+STATE = HOME / "Library/Application Support/devspaces"
+LOGS = HOME / "Library/Logs/devspaces"
+SPACECTL = STATE / "bin/spacectl"
+SNAPSHOT = STATE / "snapshot.json"
+HANDOFF = STATE / "handoff.json"
+LOCK = STATE / "lock"
+REQUESTS = STATE / "requests"
+RESPONSES = STATE / "responses"
+READY = STATE / "ready"
+APP = HOME / "Applications/Update.app"
+APP_ID = "io.github.connerstobie.update"
+
+VSCODE = Path("/Applications/Visual Studio Code.app")
+VSCODE_ID = "com.microsoft.VSCode"
+VSCODE_BINARY = VSCODE / "Contents/MacOS/Code"
+CODE_CLI = VSCODE / "Contents/Resources/app/bin/code"
+VSCODE_USER = HOME / "Library/Application Support/Code/User"
+VSCODE_UPDATE_API = "https://update.code.visualstudio.com/api/update/darwin-universal/stable/"
+SHIPIT_STATE = HOME / "Library/Caches/com.microsoft.VSCode.ShipIt/ShipItState.plist"
+CHROME = Path("/Applications/Google Chrome.app")
+CHROME_ID = "com.google.Chrome"
+CHROME_BINARY = CHROME / "Contents/MacOS/Google Chrome"
+CHROME_USER = HOME / "Library/Application Support/Google/Chrome"
+GOOGLE_UPDATER = HOME / (
+    "Library/Application Support/Google/GoogleUpdater/Current/GoogleUpdater.app/Contents/MacOS/GoogleUpdater"
+)
+SPACEMAN_ID = "io.github.connerstobie.Spaceman"
+CLAUDE_EXT = "anthropic.claude-code"
+HELPER_EXT = "connerstobie.devspaces-helper"
+HELPER_SRC = REPO / "vscode-helper"
+SKIP_PROFILES = {"Work"}  # a different Mac's setup; update never installs or updates anything there
+VSCE = "@vscode/vsce@4.0.0"
+TITLE_SEP = " — "  # VS Code joins window title parts with an em dash
+HANDOFF_MAX_AGE = 120
+
+SCREEN_RECORDING_HELP = (
+    "Window titles are hidden, so update cannot tell which folder each window shows. "
+    "Run update from VS Code's terminal, or allow Update in System Settings > "
+    "Privacy & Security > Screen & System Audio Recording."
+)
+
+
+class Failure(Exception):
+    """A step failed in a way the user should hear about; the message is shown as is."""
+
+
+# ---------------------------------------------------------------- basics
+
+def say(message):
+    print(f"{time.strftime('%H:%M:%S')} {message}", flush=True)
+
+
+def run(cmd, timeout=60, check=False, binary=False, cwd=None):
+    try:
+        result = subprocess.run(
+            [str(part) for part in cmd], capture_output=True, text=not binary, timeout=timeout,
+            stdin=subprocess.DEVNULL, cwd=cwd)
+    except subprocess.TimeoutExpired:
+        raise Failure(f"{Path(str(cmd[0])).name} did not finish within {timeout}s")
+    if check and result.returncode != 0:
+        detail = result.stderr if not binary else result.stderr.decode(errors="replace")
+        raise Failure(f"{Path(str(cmd[0])).name} failed: {detail.strip()[:400]}")
+    return result
+
+
+def osascript(script, timeout=30):
+    result = run(["/usr/bin/osascript", "-e", script], timeout=timeout)
+    if result.returncode != 0:
+        raise Failure(result.stderr.strip() or "osascript failed")
+    return result.stdout.strip()
+
+
+def applescript_text(text):
+    return '"' + text.replace("\\", "\\\\").replace('"', '\\"') + '"'
+
+
+def wait_for(predicate, timeout, interval=0.25):
+    deadline = time.monotonic() + timeout
+    while True:
+        value = predicate()
+        if value or time.monotonic() >= deadline:
+            return value
+        time.sleep(interval)
+
+
+def running(binary):
+    """True when an app's main process is running, matched on its exact executable path.
+    -a: BSD pgrep otherwise skips its own ancestors, and VS Code is one when update runs in its terminal."""
+    pattern = "^" + re.escape(str(binary)).replace("\\ ", " ") + "( |$)"
+    return run(["/usr/bin/pgrep", "-a", "-f", pattern]).returncode == 0
+
+
+def plist_value(path, key):
+    try:
+        with open(path, "rb") as handle:
+            return plistlib.load(handle).get(key)
+    except (OSError, plistlib.InvalidFileException):
+        return None
+
+
+def version_key(version):
+    return tuple(int(part) for part in re.findall(r"\d+", version or ""))
+
+
+def write_json(path, data):
+    path.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
+    tmp = path.with_name(f".{path.name}.{os.getpid()}.tmp")
+    tmp.write_text(json.dumps(data, indent=2))
+    os.chmod(tmp, 0o600)
+    os.replace(tmp, path)
+
+
+def read_json(path):
+    try:
+        return json.loads(path.read_text())
+    except (OSError, ValueError):
+        return None
+
+
+def notify(title, lines):
+    body = "\n".join(lines[:4])
+    try:
+        osascript(f"display notification {applescript_text(body)} with title {applescript_text(title)}", timeout=10)
+    except Failure as error:
+        say(f"Notification failed: {error}")
+
+
+def ask(question, buttons, default):
+    """A dialog for when there is no terminal; returns the button pressed, or None."""
+    choices = "{" + ", ".join(applescript_text(b) for b in buttons) + "}"
+    script = (
+        f"display dialog {applescript_text(question)} buttons {choices} "
+        f"default button {applescript_text(default)} with title \"Update\" giving up after 300"
+    )
+    try:
+        return osascript(f"tell me to activate\n{script}\nreturn button returned of result", timeout=310) or None
+    except Failure:
+        return None
+
+
+# ---------------------------------------------------------------- spaces
+
+def spacectl(*args):
+    result = run([SPACECTL, *args], timeout=10, check=True)
+    return int(result.stdout.strip()) if args[0] == "active" else json.loads(result.stdout)
+
+
+def active_space():
+    return spacectl("active")
+
+
+def spaceman_names():
+    """{ManagedSpaceID: name} from Spaceman's saved names."""
+    result = run(["/usr/bin/defaults", "export", SPACEMAN_ID, "-"], binary=True)
+    if result.returncode != 0:
+        return {}
+    try:
+        prefs = plistlib.loads(result.stdout)
+        stored = plistlib.loads(prefs.get("spaceNames", b""))
+    except (plistlib.InvalidFileException, ValueError, TypeError):
+        return {}
+    return {str(key): (info or {}).get("spaceName", "") for key, info in stored.items()}
+
+
+def current_spaces():
+    """The active Space id, and every Space in Mission Control order with its Spaceman name."""
+    state = spacectl("spaces")
+    names = spaceman_names()
+    spaces = []
+    for display in state["displays"]:
+        for space in display["spaces"]:
+            spaces.append({
+                "id": space["id"],
+                "name": names.get(str(space["id"]), ""),
+                "fullscreen": space["fullscreen"],
+            })
+    return state["active"], spaces
+
+
+def resolve_space(saved, spaces):
+    """Map a saved {id, name} onto a Space that exists now. Names survive reboots; ids do not."""
+    named = [s for s in spaces if saved.get("name") and s["name"].lower() == saved["name"].lower()]
+    if len(named) == 1:
+        return named[0]
+    by_id = [s for s in spaces if s["id"] == saved.get("id")]
+    return by_id[0] if by_id else None
+
+
+def switch_to(space_id):
+    if active_space() == space_id:
+        return True
+    for _ in range(2):
+        osascript(f'tell application id "{SPACEMAN_ID}" to switch to space with space id {int(space_id)}')
+        if wait_for(lambda: active_space() == space_id, 4, 0.1):
+            time.sleep(0.4)  # let the switch settle before a window is created
+            return True
+    return False
+
+
+def space_label(space):
+    return space.get("name") or f"Space {space.get('id')}"
+
+
+# ---------------------------------------------------------------- vs code knowledge
+
+def vscode_storage():
+    return read_json(VSCODE_USER / "globalStorage/storage.json") or {}
+
+
+def file_uri_to_path(uri):
+    if not uri or not uri.startswith("file://"):
+        return None
+    return urllib.request.url2pathname(uri[len("file://"):])
+
+
+def known_targets(storage):
+    """Folders and workspace files VS Code has opened, keyed by the name its window titles show."""
+    uris = []
+    windows = storage.get("windowsState", {})
+    for window in [windows.get("lastActiveWindow") or {}] + list(windows.get("openedWindows") or []):
+        uris.append(window.get("folder") or (window.get("workspace") or {}).get("configPath"))
+    uris.extend((storage.get("profileAssociations") or {}).get("workspaces", {}).keys())
+    targets = {}
+    for uri in uris:
+        path = file_uri_to_path(uri)
+        if not path:
+            continue
+        if path.endswith(".code-workspace"):
+            if "/Code/Workspaces/" in path:
+                continue  # untitled workspaces all share one title
+            name, kind = f"{Path(path).stem} (Workspace)", "workspace"
+        else:
+            name, kind = Path(path).name, "folder"
+        targets.setdefault(name, {"path": path, "kind": kind, "uri": uri})
+    return targets
+
+
+def profile_name(storage, uri):
+    location = (storage.get("profileAssociations") or {}).get("workspaces", {}).get(uri)
+    for profile in storage.get("userDataProfiles") or []:
+        if profile.get("location") == location:
+            return profile.get("name")
+    return None  # the default profile
+
+
+def match_title(title, targets):
+    segments = (title or "").split(TITLE_SEP)
+    for segment in reversed(segments):
+        if segment in targets:
+            return targets[segment]
+    return None
+
+
+def editor_state(folder_uri):
+    """The active browser tab (url, title) of a folder's saved editor layout, if it has one."""
+    storage_root = VSCODE_USER / "workspaceStorage"
+    for meta in storage_root.glob("*/workspace.json"):
+        info = read_json(meta) or {}
+        if info.get("folder") != folder_uri and info.get("workspace") != folder_uri:
+            continue
+        db = meta.parent / "state.vscdb"
+        try:
+            with sqlite3.connect(f"file:{db}?mode=ro", uri=True, timeout=5) as conn:
+                row = conn.execute(
+                    "select value from ItemTable where key = 'memento/workbench.parts.editor'").fetchone()
+        except sqlite3.Error:
+            return None
+        if not row:
+            return None
+        try:
+            root = json.loads(row[0])["editorpart.state"]["serializedGrid"]["root"]
+        except (ValueError, KeyError, TypeError):
+            return None
+        return first_active_browser(root)
+    return None
+
+
+def first_active_browser(node):
+    if node.get("type") == "leaf":
+        group = node.get("data") or {}
+        editors = group.get("editors") or []
+        mru = group.get("mru") or []
+        if mru and mru[0] < len(editors) and editors[mru[0]].get("id") == "workbench.editorinputs.browser":
+            try:
+                value = json.loads(editors[mru[0]].get("value") or "{}")
+            except ValueError:
+                return None
+            if value.get("url"):
+                return {"url": value["url"], "title": value.get("title") or ""}
+        return None
+    for child in node.get("data") or []:
+        found = first_active_browser(child)
+        if found:
+            return found
+    return None
+
+
+# ---------------------------------------------------------------- snapshot
+
+def take_snapshot():
+    active, spaces = current_spaces()
+    by_id = {s["id"]: s for s in spaces}
+    listing = spacectl("windows", VSCODE_ID, CHROME_ID)
+    vscode_windows = [w for w in listing["windows"] if w["bundle"] == VSCODE_ID]
+    chrome_windows = [w for w in listing["windows"] if w["bundle"] == CHROME_ID]
+    if vscode_windows and not listing["titlesVisible"]:
+        raise Failure(SCREEN_RECORDING_HELP)
+    storage = vscode_storage()
+    targets = known_targets(storage)
+    order = {s["id"]: index for index, s in enumerate(spaces)}
+    windows, unmatched = [], []
+    for window in vscode_windows:
+        target = match_title(window["title"], targets)
+        space = by_id.get(window["spaces"][0]) if len(window["spaces"]) == 1 else None
+        if not target or not space or space["fullscreen"]:
+            title = "".join(c if c.isprintable() else "?" for c in (window["title"] or ""))
+            unmatched.append(title or f"window {window['id']}")
+            continue
+        windows.append({
+            "path": target["path"],
+            "kind": target["kind"],
+            "uri": target["uri"],
+            "profile": profile_name(storage, target["uri"]),
+            "space": {"id": space["id"], "name": space["name"]},
+        })
+    # Space order, with the Space the user is on last so the run ends there.
+    windows.sort(key=lambda w: (w["space"]["id"] == active, order.get(w["space"]["id"], 99)))
+    chrome = {}
+    for window in chrome_windows:
+        for space_id in window["spaces"][:1]:
+            chrome[str(space_id)] = chrome.get(str(space_id), 0) + 1
+    return {
+        "v": 1,
+        "at": datetime.datetime.now().isoformat(timespec="seconds"),
+        "active": {"id": active, "name": by_id.get(active, {}).get("name", "")},
+        "windows": windows,
+        "unmatched": unmatched,
+        "chrome": chrome,
+    }
+
+
+def describe_snapshot(snapshot):
+    lines = []
+    for window in snapshot["windows"]:
+        lines.append(f"  {space_label(window['space']):<16} {Path(window['path']).name}")
+    for title in snapshot["unmatched"]:
+        lines.append(f"  (skipped)        {title}")
+    return lines
+
+
+# ---------------------------------------------------------------- vs code helper extension
+
+def helper_version():
+    return json.loads((HELPER_SRC / "package.json").read_text())["version"]
+
+
+def helper_hash():
+    digest = hashlib.sha256()
+    for name in ("package.json", "extension.js"):
+        digest.update((HELPER_SRC / name).read_bytes())
+    return digest.hexdigest()[:16]
+
+
+def build_helper_vsix():
+    """Package the helper with Microsoft's vsce (pinned), cached by source hash."""
+    vsix = STATE / f"devspaces-helper-{helper_hash()}.vsix"
+    if vsix.exists():
+        return vsix
+    npx = shutil.which("npx") or "/opt/homebrew/bin/npx"
+    with tempfile.TemporaryDirectory() as tmp:
+        for name in ("package.json", "extension.js"):
+            shutil.copy(HELPER_SRC / name, Path(tmp) / name)
+        result = run(
+            [npx, "--yes", VSCE, "package", "--no-dependencies", "--skip-license", "--out", vsix],
+            timeout=300, cwd=tmp)
+        if result.returncode != 0 or not vsix.exists():
+            raise Failure(f"Packaging the VS Code helper failed: {(result.stderr or result.stdout)[-400:]}")
+    with zipfile.ZipFile(vsix) as archive:
+        manifest = json.loads(archive.read("extension/package.json"))
+    if f"{manifest.get('publisher')}.{manifest.get('name')}" != HELPER_EXT:
+        vsix.unlink()
+        raise Failure("Packaged the wrong extension; not installing it")
+    return vsix
+
+
+def installed_extensions(profile):
+    args = [CODE_CLI, "--list-extensions", "--show-versions"] + (["--profile", profile] if profile else [])
+    result = run(args, timeout=120)
+    versions = {}
+    for line in result.stdout.splitlines():
+        if "@" in line:
+            name, _, version = line.strip().rpartition("@")
+            versions[name.lower()] = version
+    return versions
+
+
+def install_extension(source, profile, force=True):
+    if profile in SKIP_PROFILES:
+        raise Failure(f"Refusing to change the {profile} profile")
+    args = [CODE_CLI, "--install-extension", source] + (["--force"] if force else [])
+    args += ["--profile", profile] if profile else []
+    return run(args, timeout=600)
+
+
+def ensure_helper(profiles):
+    """Install or refresh the helper in each profile; returns the profiles it is current in."""
+    vsix = None
+    ready = []
+    for profile in profiles:
+        if installed_extensions(profile).get(HELPER_EXT) == helper_version():
+            ready.append(profile)
+            continue
+        vsix = vsix or build_helper_vsix()
+        result = install_extension(vsix, profile)
+        if result.returncode == 0:
+            ready.append(profile)
+        else:
+            say(f"Helper install failed in {profile or 'default'}: {result.stderr.strip()[:300]}")
+    return ready
+
+
+def live_helpers():
+    """{extension host pid: folder} for every window whose helper is running."""
+    alive = {}
+    for marker in READY.glob("*.json"):
+        try:
+            pid = int(marker.stem)
+            os.kill(pid, 0)
+        except (ValueError, ProcessLookupError):
+            marker.unlink(missing_ok=True)
+            continue
+        except PermissionError:
+            continue
+        alive[pid] = (read_json(marker) or {}).get("folder")
+    return alive
+
+
+def request(kind, timeout, **fields):
+    """Hand one request to a VS Code window's helper and wait for its answer (None if nobody took it)."""
+    for directory in (REQUESTS, RESPONSES):
+        directory.mkdir(parents=True, exist_ok=True, mode=0o700)
+    request_id = uuid.uuid4().hex
+    body = {"v": 1, "id": request_id, "type": kind, "at": int(time.time() * 1000), **fields}
+    final = REQUESTS / f"{request_id}.json"
+    tmp = REQUESTS / f".{request_id}.tmp"
+    tmp.write_text(json.dumps(body))
+    os.chmod(tmp, 0o600)
+    os.replace(tmp, final)
+    answer = RESPONSES / f"{request_id}.json"
+    if not wait_for(answer.exists, timeout, 0.2):
+        final.unlink(missing_ok=True)
+        return None
+    time.sleep(0.05)
+    data = read_json(answer) or {}
+    answer.unlink(missing_ok=True)
+    return data
+
+
+# ---------------------------------------------------------------- versions and updates
+
+def vscode_version():
+    version = plist_value(VSCODE / "Contents/Info.plist", "CFBundleShortVersionString")
+    product = read_json(VSCODE / "Contents/Resources/app/product.json") or {}
+    return version, product.get("commit")
+
+
+def vscode_latest(commit):
+    """The newest stable VS Code, or None when this build is current or the check fails."""
+    try:
+        with urllib.request.urlopen(VSCODE_UPDATE_API + commit, timeout=15) as response:
+            if response.status == 204:
+                return None
+            data = json.loads(response.read() or b"{}")
+            return data.get("productVersion")
+    except (urllib.error.URLError, ValueError, OSError) as error:
+        say(f"VS Code update check failed: {error}")
+        return None
+
+
+def shipit_pending():
+    """The version VS Code's own updater (ShipIt) is waiting to install, if it is waiting."""
+    if run(["/usr/bin/pgrep", "-a", "-f", "ShipIt com\\.microsoft\\.VSCode\\.ShipIt"]).returncode != 0:
+        return None
+    # Squirrel writes this ".plist" as JSON.
+    bundle = file_uri_to_path((read_json(SHIPIT_STATE) or {}).get("updateBundleURL") or "")
+    return plist_value(Path(bundle) / "Contents/Info.plist", "CFBundleShortVersionString") if bundle else None
+
+
+def claude_latest():
+    """Latest release of the Claude Code extension on the Marketplace, or None."""
+    body = json.dumps({
+        "filters": [{"criteria": [{"filterType": 7, "value": CLAUDE_EXT}]}],
+        "flags": 0x1 | 0x10 | 0x200,
+    }).encode()
+    req = urllib.request.Request(
+        "https://marketplace.visualstudio.com/_apis/public/gallery/extensionquery", data=body,
+        headers={"Content-Type": "application/json", "Accept": "application/json;api-version=3.0-preview.1"})
+    try:
+        with urllib.request.urlopen(req, timeout=15) as response:
+            data = json.loads(response.read())
+        for version in data["results"][0]["extensions"][0]["versions"]:
+            props = {p["key"]: p["value"] for p in version.get("properties") or []}
+            if props.get("Microsoft.VisualStudio.Code.PreRelease") != "true":
+                return version["version"]
+    except (urllib.error.URLError, ValueError, KeyError, IndexError, OSError) as error:
+        say(f"Claude Code version check failed: {error}")
+    return None
+
+
+def chrome_versions():
+    """(version the running Chrome started as, version on disk)."""
+    try:
+        started = (CHROME_USER / "Last Version").read_text().strip()
+    except OSError:
+        started = None
+    return started, plist_value(CHROME / "Contents/Info.plist", "CFBundleShortVersionString")
+
+
+def chrome_update_ready():
+    started, disk = chrome_versions()
+    return bool(started and disk and version_key(disk) > version_key(started))
+
+
+# ---------------------------------------------------------------- the run
+
+class Report:
+    def __init__(self):
+        self.lines = []
+        self.problems = []
+
+    def ok(self, line):
+        say(f"OK   {line}")
+        self.lines.append(line)
+
+    def warn(self, line):
+        say(f"WARN {line}")
+        self.problems.append(line)
+
+
+def update_chrome(report, enabled):
+    """Get Chrome's own updater to stage a new version; True when Chrome needs a relaunch."""
+    if not enabled or not running(CHROME_BINARY):
+        return False
+    if not chrome_update_ready() and GOOGLE_UPDATER.exists():
+        say("Asking Chrome's updater for an update")
+        result = run([GOOGLE_UPDATER, "--update-apps"], timeout=900)
+        if result.returncode != 0:
+            say(f"Chrome updater exited {result.returncode}")
+    started, disk = chrome_versions()
+    if chrome_update_ready():
+        say(f"Chrome {started} -> {disk} is ready")
+        return True
+    report.ok(f"Chrome {disk} Up To Date")
+    return False
+
+
+def stage_vscode_update():
+    """Make sure VS Code's own updater has the newest version downloaded; returns that version."""
+    current, commit = vscode_version()
+    latest = vscode_latest(commit) if commit else None
+    if not latest or version_key(latest) <= version_key(current):
+        return None
+    if shipit_pending() == latest:
+        return latest
+    say(f"Asking VS Code to download {latest}")
+    if request("check-update", 15) is None:
+        say("No VS Code window answered the update request")
+        return latest
+    wait_for(lambda: shipit_pending() == latest, 600, 2)
+    return latest
+
+
+def quit_vscode():
+    if not running(VSCODE_BINARY):
+        return True
+    answer = request("quit", 10) if live_helpers() else None
+    if answer is None:
+        osascript(f'ignoring application responses\ntell application id "{VSCODE_ID}" to quit\nend ignoring')
+    return wait_for(lambda: not running(VSCODE_BINARY), 90, 0.5)
+
+
+def quit_chrome():
+    osascript(f'ignoring application responses\ntell application id "{CHROME_ID}" to quit\nend ignoring')
+    return wait_for(lambda: not running(CHROME_BINARY), 60, 0.5)
+
+
+def finish_vscode_update(report, before, target):
+    # ShipIt swaps the app bundle once VS Code quits; never start VS Code mid-swap.
+    if not wait_for(lambda: shipit_pending() is None, 300, 1):
+        report.warn("VS Code Installer Still Running After 5 Minutes")
+    after, _ = vscode_version()
+    if target and version_key(after) < version_key(target):
+        report.warn(f"VS Code Still On {after}, {target} Did Not Install")
+    elif after != before:
+        report.ok(f"VS Code {before} \u2192 {after}")
+    else:
+        report.ok(f"VS Code {after} Up To Date")
+
+
+def update_claude(report, profiles):
+    for profile in profiles:
+        before = installed_extensions(profile).get(CLAUDE_EXT)
+        if not before:
+            continue
+        result = install_extension(CLAUDE_EXT, profile)
+        after = installed_extensions(profile).get(CLAUDE_EXT)
+        where = profile or "Default Profile"
+        if result.returncode != 0:
+            report.warn(f"Claude Code Update Failed In {where}")
+            say(result.stderr.strip()[:400])
+        elif after != before:
+            report.ok(f"Claude Code {before} \u2192 {after}")
+        else:
+            report.ok(f"Claude Code {after} Up To Date")
+
+
+def open_window(window, space_id):
+    """Open one folder in a new VS Code window on the Space now showing; returns the new window."""
+    before = {w["id"] for w in spacectl("windows", VSCODE_ID)["windows"]}
+    if not running(VSCODE_BINARY):
+        run(["/usr/bin/open", "-a", VSCODE, "--args", "--new-window", window["path"]], check=True)
+    elif request("open", 45, path=window["path"]) is None:
+        say("No helper answered; falling back to the code command, which can land on another Space")
+        run([CODE_CLI, "--new-window", window["path"]], timeout=60)
+
+    def new_window():
+        fresh = [w for w in spacectl("windows", VSCODE_ID)["windows"] if w["id"] not in before]
+        return fresh[0] if fresh else None
+
+    return wait_for(new_window, 120, 0.5)
+
+
+def restore_devtools(window, browser):
+    """Bring back the browser tab's DevTools, which VS Code does not save across restarts."""
+    if not browser:
+        return
+    real = os.path.realpath(window["path"])
+    if not wait_for(lambda: real in {os.path.realpath(f) for f in live_helpers().values() if f}, 60, 0.5):
+        say(f"No helper in {Path(window['path']).name}; DevTools not reopened")
+        return
+    time.sleep(3)  # give the restored browser tab time to load its page
+    answer = request("devtools", 30, folder=real, title=browser["title"])
+    if not answer or not answer.get("ok"):
+        say(f"DevTools not reopened in {Path(window['path']).name}: {(answer or {}).get('error')}")
+
+
+def restore_windows(report, snapshot):
+    _, spaces = current_spaces()
+    start = active_space()
+    landed, misplaced = 0, []
+    for window in snapshot["windows"]:
+        name = Path(window["path"]).name
+        if not Path(window["path"]).exists():
+            report.warn(f"{name} No Longer Exists")
+            continue
+        space = resolve_space(window["space"], spaces)
+        if not space:
+            report.warn(f"{space_label(window['space'])} Space Is Gone, {name} Opened Here")
+        elif not switch_to(space["id"]):
+            report.warn(f"Could Not Switch To {space_label(space)}")
+        browser = editor_state(window["uri"]) if window["kind"] == "folder" else None
+        say(f"Opening {name} on {space_label(space or window['space'])}")
+        opened = open_window(window, space["id"] if space else None)
+        if not opened:
+            report.warn(f"{name} Did Not Open")
+            continue
+        if space and space["id"] not in opened["spaces"]:
+            here = next((s for s in spaces if s["id"] in opened["spaces"]), None)
+            misplaced.append(f"{name} Landed On {space_label(here or {})}")
+        else:
+            landed += 1
+        restore_devtools(window, browser)
+    final = resolve_space(snapshot["active"], spaces)
+    switch_to(final["id"] if final else start)
+    if landed:
+        report.ok(f"{landed} Window{'s' if landed != 1 else ''} Back On {'Their' if landed != 1 else 'Its'} Space")
+    for line in misplaced:
+        report.warn(line)
+
+
+def check_chrome_spaces(report, snapshot):
+    def placed():
+        listing = spacectl("windows", CHROME_ID)["windows"]
+        return {str(s) for w in listing for s in w["spaces"][:1]}
+
+    expected = set(snapshot.get("chrome", {}))
+    if not expected:
+        return
+    have = wait_for(lambda: expected <= placed() and placed(), 60, 1) or placed()
+    _, spaces = current_spaces()
+    names = {str(s["id"]): space_label(s) for s in spaces}
+    missing = sorted(expected - have)
+    if missing:
+        for space_id in missing:
+            report.warn(f"Chrome Window Missing On {names.get(space_id, 'Space ' + space_id)}")
+    else:
+        report.ok("Chrome Windows Back On Their Spaces")
+
+
+def run_job(job):
+    """The work itself; runs inside Update.app so VS Code quitting cannot kill it."""
+    LOCK.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
+    with open(LOCK, "w") as lock:
+        try:
+            fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except BlockingIOError:
+            notify("Update", ["Already Running"])
+            return
+        report = Report()
+        snapshot = job["snapshot"]
+        say(f"Job: update, {len(snapshot['windows'])} VS Code windows")
+        try:
+            do_update(report, job, snapshot)
+        except Failure as error:
+            report.warn(str(error))
+        except Exception as error:  # keep the user informed even on a bug
+            report.warn(f"Stopped: {type(error).__name__}")
+            say(f"Unexpected error: {error!r}")
+            raise
+        finally:
+            title = "Update Done" if not report.problems else "Update Needs A Look"
+            notify(title, ["⚠️ " + p for p in report.problems] + ["✅ " + line for line in report.lines])
+            say("Finished")
+
+
+def do_update(report, job, snapshot):
+    profiles = profiles_of(snapshot)
+    vscode_was_running = running(VSCODE_BINARY)
+    preflight_permissions()
+    chrome_relaunch = update_chrome(report, True)
+    vscode_target = stage_vscode_update() if vscode_was_running else None
+    before, _ = vscode_version()
+
+    if vscode_was_running:
+        say("Quitting VS Code")
+        if not quit_vscode():
+            raise Failure("VS Code Did Not Quit, Nothing Was Changed")
+    # From here on VS Code is closed: every path below ends by reopening its windows.
+    try:
+        if chrome_relaunch:
+            say("Quitting Chrome")
+            if not quit_chrome():
+                report.warn("Chrome Did Not Quit, Check For A Download Or Leave Page Prompt")
+                chrome_relaunch = False
+        finish_vscode_update(report, before, vscode_target)
+        update_claude(report, profiles)
+        ensure_helper(profiles)
+    except Failure as error:
+        report.warn(str(error))
+    finally:
+        try:
+            if chrome_relaunch:
+                say("Relaunching Chrome")
+                run(["/usr/bin/open", "-a", CHROME, "--args", "--restore-last-session"], check=True)
+                _, disk = chrome_versions()
+                report.ok(f"Chrome Updated To {disk}")
+                check_chrome_spaces(report, snapshot)
+        finally:
+            if vscode_was_running:
+                restore_windows(report, snapshot)
+
+
+# ---------------------------------------------------------------- front end
+
+def busy_claude_sessions(seconds=90):
+    root = HOME / ".claude/projects"
+    prefix = str(HOME).replace("/", "-") + "-"
+    now = time.time()
+    busy = set()
+    for transcript in root.glob("*/*.jsonl"):
+        try:
+            if now - transcript.stat().st_mtime < seconds:
+                busy.add(transcript.parent.name.replace(prefix, "", 1))
+        except OSError:
+            continue
+    return sorted(busy)
+
+
+def plan_lines(snapshot):
+    lines = []
+    current, commit = vscode_version()
+    latest = vscode_latest(commit) if commit else None
+    if latest and version_key(latest) > version_key(current):
+        staged = " (downloaded)" if shipit_pending() == latest else ""
+        lines.append(f"VS Code {current} -> {latest}{staged}")
+    else:
+        lines.append(f"VS Code {current} is current")
+    newest = claude_latest()
+    for profile in profiles_of(snapshot):
+        version = installed_extensions(profile).get(CLAUDE_EXT)
+        if version:
+            arrow = f" -> {newest}" if newest and version_key(newest) > version_key(version) else " is current"
+            lines.append(f"Claude Code ({profile}) {version}{arrow}")
+    started, disk = chrome_versions()
+    if chrome_update_ready():
+        lines.append(f"Chrome {started} -> {disk} (downloaded)")
+    else:
+        lines.append(f"Chrome {disk}: asks Chrome's updater, relaunches only if there is an update")
+    return lines
+
+
+def profiles_of(snapshot):
+    """VS Code profiles of the windows being reopened; the only ones update touches."""
+    return sorted({w["profile"] for w in snapshot["windows"] if w["profile"]} - SKIP_PROFILES)
+
+
+def prepare():
+    """Snapshot the windows and build or install anything missing; nothing quits here."""
+    ensure_spacectl()
+    preflight_spaceman()
+    snapshot = take_snapshot()
+    write_json(SNAPSHOT, snapshot)
+    ensure_helper(profiles_of(snapshot))
+    build_app()
+    return snapshot
+
+
+def cmd_update(args):
+    if running_app():
+        raise Failure("Update is already running")
+    snapshot = prepare()
+    print("Windows to reopen:")
+    print("\n".join(describe_snapshot(snapshot)) or "  (no VS Code windows)")
+    print("Updates:")
+    for line in plan_lines(snapshot):
+        print(f"  {line}")
+    busy = busy_claude_sessions()
+    if busy:
+        print("Claude chats active in the last 90s (quitting VS Code stops them):")
+        for name in busy:
+            print(f"  {name}")
+    if not args.yes:
+        if not sys.stdin.isatty():
+            raise Failure("No terminal to confirm in; rerun with --yes")
+        if input("Go ahead? [y/N] ").strip().lower() not in ("y", "yes"):
+            print("Nothing changed.")
+            return
+    write_json(HANDOFF, {"mode": "update", "snapshot": snapshot, "at": time.time()})
+    run(["/usr/bin/open", "-a", APP], check=True)
+    print(f"Update is running. A notification says when it is done. Log: {LOGS}")
+
+
+def cmd_app():
+    """Entry point inside Update.app (handed a job by the update command, or opened from Spotlight)."""
+    LOGS.mkdir(parents=True, exist_ok=True)
+    job = read_json(HANDOFF)
+    HANDOFF.unlink(missing_ok=True)
+    if job and time.time() - job.get("at", 0) > HANDOFF_MAX_AGE:
+        job = None
+    if not job:
+        choice = ask("Update Chrome, VS Code and Claude Code, then reopen every window on its Space?",
+                     ["Cancel", "Update"], "Update")
+        if choice != "Update":
+            return
+        try:
+            ensure_spacectl()
+            if not spacectl("windows", VSCODE_ID)["titlesVisible"]:
+                run([SPACECTL, "request-capture"], timeout=10)
+                raise Failure("Allow Update under Screen Recording, then open it again")
+            job = {"mode": "update", "snapshot": prepare()}
+        except Failure as error:
+            notify("Update Needs A Look", [str(error)])
+            return
+    run_job(job)
+
+
+def running_app():
+    return run(["/usr/bin/pgrep", "-a", "-f", re.escape(str(APP)).replace("\\ ", " ")]).returncode == 0
+
+
+# ---------------------------------------------------------------- building the helpers
+
+def ensure_spacectl():
+    source = REPO / "spacectl.swift"
+    stamp = SPACECTL.with_suffix(".sha256")
+    digest = hashlib.sha256(source.read_bytes()).hexdigest()
+    if SPACECTL.exists() and stamp.exists() and stamp.read_text().strip() == digest:
+        return
+    SPACECTL.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
+    run(["/usr/bin/swiftc", "-O", source, "-o", SPACECTL], timeout=300, check=True)
+    stamp.write_text(digest)
+
+
+def preflight_spaceman(timeout=30):
+    try:
+        osascript(f'tell application id "{SPACEMAN_ID}" to switch to space with space id {active_space()}',
+                  timeout=timeout)
+    except Failure as error:
+        raise Failure(f"Spaceman cannot switch Spaces from a script (needs 1.29.0 or later): {error}")
+
+
+def preflight_permissions():
+    """Ask for the macOS permissions up front, while nothing has quit yet.
+    The first run shows "Update wants to control Spaceman / Google Chrome" prompts here."""
+    preflight_spaceman(timeout=180)
+    if running(CHROME_BINARY):
+        osascript(f'tell application id "{CHROME_ID}" to count windows', timeout=180)
+
+
+APPLET_SOURCE = """on run
+\ttry
+\t\tdo shell script "/usr/bin/python3 " & quoted form of {script} & " --app >> " & quoted form of {log} & " 2>&1"
+\ton error errorText
+\t\tdisplay alert "Update" message errorText
+\tend try
+end run
+"""
+
+
+def build_app():
+    """Build Update.app when missing or changed; a rebuild resets its macOS permissions."""
+    LOGS.mkdir(parents=True, exist_ok=True)
+    source = APPLET_SOURCE.format(
+        script=applescript_text(str(REPO / "update")), log=applescript_text(str(LOGS / "update.log")))
+    stamp = STATE / "app.sha256"
+    digest = hashlib.sha256(source.encode()).hexdigest()
+    if APP.exists() and stamp.exists() and stamp.read_text().strip() == digest:
+        return False
+    APP.parent.mkdir(parents=True, exist_ok=True)
+    with tempfile.TemporaryDirectory() as tmp:
+        script = Path(tmp) / "Update.applescript"
+        script.write_text(source)
+        built = Path(tmp) / "Update.app"
+        run(["/usr/bin/osacompile", "-o", built, script], timeout=60, check=True)
+        info = built / "Contents/Info.plist"
+        with open(info, "rb") as handle:
+            plist = plistlib.load(handle)
+        plist["CFBundleIdentifier"] = APP_ID
+        plist["NSAppleEventsUsageDescription"] = "Update switches Spaces with Spaceman and quits Chrome."
+        with open(info, "wb") as handle:
+            plistlib.dump(plist, handle)
+        run(["/usr/bin/codesign", "--force", "--sign", "-", built], timeout=60, check=True)
+        if APP.exists():
+            run(["/usr/bin/trash", APP], check=True)
+        shutil.move(str(built), str(APP))
+    stamp.write_text(digest)
+    print("Built ~/Applications/Update.app")
+    return True
+
+
+def main():
+    parser = argparse.ArgumentParser(
+        prog="update", description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
+    parser.add_argument("--yes", "-y", action="store_true", help="skip the confirmation")
+    parser.add_argument("--app", action="store_true", help=argparse.SUPPRESS)
+    args = parser.parse_args()
+    os.umask(0o077)
+    os.environ["PATH"] = "/opt/homebrew/bin:/usr/bin:/bin:/usr/sbin:/sbin"
+    try:
+        cmd_app() if args.app else cmd_update(args)
+    except Failure as error:
+        print(f"update: {error}", file=sys.stderr)
+        sys.exit(1)
+    except KeyboardInterrupt:
+        sys.exit(130)
+
+
+if __name__ == "__main__":
+    main()

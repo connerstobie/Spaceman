@@ -32,7 +32,13 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
 
     static var activeSpaceIDs: Set<String> = []
 
+    /// Set at launch for AppleScript commands. NSApp.delegate is SwiftUI's
+    /// adaptor proxy, not this class, so commands cannot reach us through it.
+    static weak var shared: AppDelegate?
+
     func applicationDidFinishLaunching(_ aNotification: Notification) {
+        AppDelegate.shared = self
+
         // Legacy settings migration - can be removed in future versions
         LegacyMigrations.perform()
 
@@ -111,6 +117,10 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
 
     @objc private func openPreferencesFromScript() {
         statusBar.showPreferencesWindow(self)
+    }
+
+    func switchToSpace(matching target: SpaceTarget) -> SpaceTarget.Resolution {
+        return statusBar.switchToSpace(matching: target)
     }
 
     // MARK: - AppleScript Properties

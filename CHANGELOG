@@ -1,3 +1,4 @@
+1.29.0: AppleScript "switch to space" command (by name, number or space id) so scripts can move between spaces with the same switching mode as a click; devspaces/update uses it to update Chrome, VS Code and Claude Code and reopen every VS Code window on its space
 1.28.0: Fit-to-width now measures the free menu bar space and picks the largest size that fits; undecorated spaces use tighter padding
 1.27.0: Removed the numbers-only and app-icon auto-shrink fallbacks; when the icon does not fit, the size steps down and names stay in full
 1.26.0: Two-row layout gains Extra Large (12pt) and Enormous (13pt) sizes for the taller menu bar of notched MacBooks

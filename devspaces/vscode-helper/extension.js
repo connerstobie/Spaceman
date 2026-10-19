@@ -104,8 +104,10 @@ async function handle(name) {
         return;
     }
     try {
-        await perform(request);
-        respond(request.id, true);
+        // quit and close answer for themselves, before the window goes away
+        if (await perform(request) !== 'answered') {
+            respond(request.id, true);
+        }
     } catch (error) {
         log.appendLine(`Request ${request.id} failed: ${error.message}`);
         respond(request.id, false, error.message);
@@ -135,13 +137,13 @@ async function perform(request) {
             log.appendLine('Closing this window.');
             respond(request.id, true);
             await vscode.commands.executeCommand('workbench.action.closeWindow');
-            return;
+            return 'answered';
         case 'quit':
             log.appendLine('Quitting VS Code.');
             // Answer before quitting; nothing runs after the command.
             respond(request.id, true);
             await vscode.commands.executeCommand('workbench.action.quit');
-            return;
+            return 'answered';
         default:
             throw new Error('Unknown request type.');
     }
@@ -171,8 +173,13 @@ function meantForThisWindow(file) {
 // they show as tabs with no known input, matched here by page title.
 async function openBrowserDevTools(title) {
     const ordinals = ['First', 'Second', 'Third', 'Fourth', 'Fifth', 'Sixth', 'Seventh', 'Eighth'];
-    const isBrowser = (tab) => tab && tab.input === undefined && (!title || tab.label === title);
-    const group = vscode.window.tabGroups.all.find((candidate) => isBrowser(candidate.activeTab));
+    const groups = vscode.window.tabGroups.all;
+    const unknownInput = (group) => group.activeTab && group.activeTab.input === undefined;
+    // The saved title picks the tab; a dev server that is down changes the title, so fall back
+    // to the only front tab VS Code cannot otherwise describe.
+    const titled = groups.filter((group) => unknownInput(group) && group.activeTab.label === title);
+    const untyped = groups.filter(unknownInput);
+    const group = titled.length === 1 ? titled[0] : untyped.length === 1 ? untyped[0] : undefined;
     // viewColumn counts groups in the order they appear, as the focus commands do.
     const column = group?.viewColumn;
     if (!column || column > ordinals.length) {
@@ -206,7 +213,10 @@ function respond(id, ok, error) {
     const file = path.join(RESPONSES, `${id}.json`);
     const body = JSON.stringify({ id, ok, error: error ?? null, pid: process.pid, at: Date.now() });
     try {
-        fs.writeFileSync(file, body, { mode: 0o600 });
+        // write then rename, so the script never reads a half-written answer
+        const partial = path.join(RESPONSES, `.${id}.${process.pid}.tmp`);
+        fs.writeFileSync(partial, body, { mode: 0o600 });
+        fs.renameSync(partial, file);
     } catch (writeError) {
         log.appendLine(`Could not answer ${id}: ${writeError.message}`);
     }

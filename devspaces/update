@@ -92,6 +92,8 @@ def run(cmd, timeout=60, check=False, binary=False, cwd=None):
             stdin=subprocess.DEVNULL, cwd=cwd)
     except subprocess.TimeoutExpired:
         raise Failure(f"{Path(str(cmd[0])).name} did not finish within {timeout}s")
+    except OSError as error:
+        raise Failure(f"{Path(str(cmd[0])).name} could not run: {error.strerror}")
     if check and result.returncode != 0:
         detail = result.stderr if not binary else result.stderr.decode(errors="replace")
         raise Failure(f"{Path(str(cmd[0])).name} failed: {detail.strip()[:400]}")
@@ -266,7 +268,10 @@ def known_targets(storage):
             name, kind = f"{Path(path).stem} (Workspace)", "workspace"
         else:
             name, kind = Path(path).name, "folder"
-        targets.setdefault(name, {"path": path, "kind": kind, "uri": uri})
+        entry = {"path": path, "kind": kind, "uri": uri}
+        same = targets.setdefault(name, [])
+        if all(existing["path"] != path for existing in same):
+            same.append(entry)
     return targets
 
 
@@ -278,35 +283,41 @@ def profile_name(storage, uri):
     return None  # the default profile
 
 
-def match_title(title, targets):
-    segments = (title or "").split(TITLE_SEP)
-    for segment in reversed(segments):
-        if segment in targets:
-            return targets[segment]
+def match_title(title, targets, open_folders=()):
+    """The folder a window title shows. Two folders with the same name are told apart by
+    which one is open; when that cannot settle it, None (the window is reported, not guessed)."""
+    for segment in reversed((title or "").split(TITLE_SEP)):
+        candidates = targets.get(segment)
+        if not candidates:
+            continue
+        if len(candidates) == 1:
+            return candidates[0]
+        open_ones = [c for c in candidates if os.path.realpath(c["path"]) in open_folders]
+        return open_ones[0] if len(open_ones) == 1 else None
     return None
 
 
 def editor_state(folder_uri):
     """The active browser tab (url, title) of a folder's saved editor layout, if it has one."""
     storage_root = VSCODE_USER / "workspaceStorage"
+    matches = []
     for meta in storage_root.glob("*/workspace.json"):
         info = read_json(meta) or {}
-        if info.get("folder") != folder_uri and info.get("workspace") != folder_uri:
-            continue
-        db = meta.parent / "state.vscdb"
+        if folder_uri in (info.get("folder"), info.get("workspace")):
+            db = meta.parent / "state.vscdb"
+            if db.exists():
+                matches.append(db)
+    # VS Code can keep more than one storage folder for a folder; the newest is the live one.
+    for db in sorted(matches, key=lambda path: path.stat().st_mtime, reverse=True):
         try:
             with sqlite3.connect(f"file:{db}?mode=ro", uri=True, timeout=5) as conn:
                 row = conn.execute(
                     "select value from ItemTable where key = 'memento/workbench.parts.editor'").fetchone()
-        except sqlite3.Error:
-            return None
-        if not row:
-            return None
-        try:
-            root = json.loads(row[0])["editorpart.state"]["serializedGrid"]["root"]
-        except (ValueError, KeyError, TypeError):
-            return None
-        return first_active_browser(root)
+            root = json.loads(row[0])["editorpart.state"]["serializedGrid"]["root"] if row else None
+        except (sqlite3.Error, ValueError, KeyError, TypeError):
+            root = None
+        if root:
+            return first_active_browser(root)
     return None
 
 
@@ -342,11 +353,14 @@ def take_snapshot():
         raise Failure(SCREEN_RECORDING_HELP)
     storage = vscode_storage()
     targets = known_targets(storage)
+    open_folders = {os.path.realpath(f) for f in live_helpers().values() if f}
     order = {s["id"]: index for index, s in enumerate(spaces)}
     windows, unmatched = [], []
     for window in vscode_windows:
-        target = match_title(window["title"], targets)
+        target = match_title(window["title"], targets, open_folders)
         space = by_id.get(window["spaces"][0]) if len(window["spaces"]) == 1 else None
+        if target and Path(target["path"]).resolve().is_relative_to(STATE.resolve()):
+            continue  # update's own scratch folders are never reopened
         if not target or not space or space["fullscreen"]:
             title = "".join(c if c.isprintable() else "?" for c in (window["title"] or ""))
             unmatched.append(title or f"window {window['id']}")
@@ -442,12 +456,15 @@ def ensure_helper(profiles):
     vsix = None
     ready = []
     for profile in profiles:
-        if installed_extensions(profile).get(HELPER_EXT) == helper_version():
+        stamp = STATE / f"helper-{profile or 'default'}.sha"
+        current = stamp.exists() and stamp.read_text().strip() == helper_hash()
+        if current and installed_extensions(profile).get(HELPER_EXT) == helper_version():
             ready.append(profile)
             continue
         vsix = vsix or build_helper_vsix()
         result = install_extension(vsix, profile)
         if result.returncode == 0:
+            stamp.write_text(helper_hash())
             ready.append(profile)
         else:
             say(f"Helper install failed in {profile or 'default'}: {result.stderr.strip()[:300]}")
@@ -499,17 +516,20 @@ def vscode_version():
     return version, product.get("commit")
 
 
+CHECK_FAILED = "check failed"
+
+
 def vscode_latest(commit):
-    """The newest stable VS Code, or None when this build is current or the check fails."""
+    """The newest stable VS Code; None when this build is current, CHECK_FAILED when unknown."""
     try:
         with urllib.request.urlopen(VSCODE_UPDATE_API + commit, timeout=15) as response:
             if response.status == 204:
                 return None
             data = json.loads(response.read() or b"{}")
-            return data.get("productVersion")
+            return data.get("productVersion") or CHECK_FAILED
     except (urllib.error.URLError, ValueError, OSError) as error:
         say(f"VS Code update check failed: {error}")
-        return None
+        return CHECK_FAILED
 
 
 def shipit_pending():
@@ -593,7 +613,7 @@ def stage_vscode_update():
     """Make sure VS Code's own updater has the newest version downloaded; returns that version."""
     current, commit = vscode_version()
     latest = vscode_latest(commit) if commit else None
-    if not latest or version_key(latest) <= version_key(current):
+    if not latest or latest == CHECK_FAILED or version_key(latest) <= version_key(current):
         return None
     if shipit_pending() == latest:
         return latest
@@ -609,7 +629,7 @@ def quit_vscode():
     if not running(VSCODE_BINARY):
         return True
     answer = request("quit", 10) if live_helpers() else None
-    if answer is None:
+    if not answer or not answer.get("ok"):
         osascript(f'ignoring application responses\ntell application id "{VSCODE_ID}" to quit\nend ignoring')
     return wait_for(lambda: not running(VSCODE_BINARY), 90, 0.5)
 
@@ -654,9 +674,12 @@ def open_window(window, space_id):
     before = {w["id"] for w in spacectl("windows", VSCODE_ID)["windows"]}
     if not running(VSCODE_BINARY):
         run(["/usr/bin/open", "-a", VSCODE, "--args", "--new-window", window["path"]], check=True)
-    elif request("open", 45, path=window["path"]) is None:
-        say("No helper answered; falling back to the code command, which can land on another Space")
-        run([CODE_CLI, "--new-window", window["path"]], timeout=60)
+    else:
+        answer = request("open", 45, path=window["path"])
+        if not answer or not answer.get("ok"):
+            say(f"Helper did not open it ({(answer or {}).get('error')}); using the code command, "
+                "which can land on another Space")
+            run([CODE_CLI, "--new-window", window["path"]], timeout=60)
 
     def new_window():
         fresh = [w for w in spacectl("windows", VSCODE_ID)["windows"] if w["id"] not in before]
@@ -679,34 +702,50 @@ def restore_devtools(window, browser):
         say(f"DevTools not reopened in {Path(window['path']).name}: {(answer or {}).get('error')}")
 
 
-def restore_windows(report, snapshot):
+def restore_windows(report, snapshot, skip=()):
+    """Reopen every snapshot window on its Space. One window's trouble never stops the rest,
+    and if VS Code is still closed at the end it is opened bare so its own restore runs."""
     _, spaces = current_spaces()
     start = active_space()
     landed, misplaced = 0, []
     for window in snapshot["windows"]:
         name = Path(window["path"]).name
-        if not Path(window["path"]).exists():
-            report.warn(f"{name} No Longer Exists")
-            continue
-        space = resolve_space(window["space"], spaces)
-        if not space:
-            report.warn(f"{space_label(window['space'])} Space Is Gone, {name} Opened Here")
-        elif not switch_to(space["id"]):
-            report.warn(f"Could Not Switch To {space_label(space)}")
-        browser = editor_state(window["uri"]) if window["kind"] == "folder" else None
-        say(f"Opening {name} on {space_label(space or window['space'])}")
-        opened = open_window(window, space["id"] if space else None)
-        if not opened:
-            report.warn(f"{name} Did Not Open")
-            continue
-        if space and space["id"] not in opened["spaces"]:
-            here = next((s for s in spaces if s["id"] in opened["spaces"]), None)
-            misplaced.append(f"{name} Landed On {space_label(here or {})}")
-        else:
-            landed += 1
-        restore_devtools(window, browser)
-    final = resolve_space(snapshot["active"], spaces)
-    switch_to(final["id"] if final else start)
+        try:
+            real = os.path.realpath(window["path"])
+            if real in skip or real in {os.path.realpath(f) for f in live_helpers().values() if f}:
+                continue  # still open, or reopened by hand during the run
+            if not Path(window["path"]).exists():
+                report.warn(f"{name} No Longer Exists")
+                continue
+            space = resolve_space(window["space"], spaces)
+            if not space:
+                report.warn(f"{space_label(window['space'])} Space Is Gone, {name} Opened Here")
+            elif not switch_to(space["id"]):
+                report.warn(f"Could Not Switch To {space_label(space)}")
+            browser = editor_state(window["uri"]) if window["kind"] == "folder" else None
+            say(f"Opening {name} on {space_label(space or window['space'])}")
+            opened = open_window(window, space["id"] if space else None)
+            if not opened:
+                report.warn(f"{name} Did Not Open")
+                continue
+            if space and space["id"] not in opened["spaces"]:
+                here = next((s for s in spaces if s["id"] in opened["spaces"]), None)
+                misplaced.append(f"{name} Landed On {space_label(here or {})}")
+            else:
+                landed += 1
+            restore_devtools(window, browser)
+        except Failure as error:
+            report.warn(f"{name}: {error}")
+    for title in snapshot.get("unmatched") or []:
+        report.warn(f"Not Reopened: {title}")
+    try:
+        final = resolve_space(snapshot["active"], spaces)
+        switch_to(final["id"] if final else start)
+    except Failure as error:
+        say(f"Could not switch back: {error}")
+    if snapshot["windows"] and not running(VSCODE_BINARY):
+        report.warn("Windows Did Not Reopen, VS Code Restored Them On One Space")
+        run(["/usr/bin/open", "-a", VSCODE])
     if landed:
         report.ok(f"{landed} Window{'s' if landed != 1 else ''} Back On {'Their' if landed != 1 else 'Its'} Space")
     for line in misplaced:
@@ -758,10 +797,21 @@ def run_job(job):
             say("Finished")
 
 
+def relaunch_chrome(report, snapshot):
+    if running(CHROME_BINARY):
+        report.warn("Chrome Was Reopened By Hand, Tabs May Not Have Come Back")
+        return
+    say("Relaunching Chrome")
+    run(["/usr/bin/open", "-a", CHROME, "--args", "--restore-last-session"], check=True)
+    _, disk = chrome_versions()
+    report.ok(f"Chrome Updated To {disk}")
+    check_chrome_spaces(report, snapshot)
+
+
 def do_update(report, job, snapshot):
     profiles = profiles_of(snapshot)
     vscode_was_running = running(VSCODE_BINARY)
-    preflight_permissions()
+    preflight_permissions()  # before anything quits: the first run's permission prompts show here
     chrome_relaunch = update_chrome(report, True)
     vscode_target = stage_vscode_update() if vscode_was_running else None
     before, _ = vscode_version()
@@ -769,30 +819,35 @@ def do_update(report, job, snapshot):
     if vscode_was_running:
         say("Quitting VS Code")
         if not quit_vscode():
-            raise Failure("VS Code Did Not Quit, Nothing Was Changed")
+            still_open = {os.path.realpath(f) for f in live_helpers().values() if f}
+            report.warn("VS Code Did Not Quit, Updates Skipped")
+            restore_windows(report, snapshot, skip=still_open)
+            return
     # From here on VS Code is closed: every path below ends by reopening its windows.
     try:
         if chrome_relaunch:
-            say("Quitting Chrome")
-            if not quit_chrome():
-                report.warn("Chrome Did Not Quit, Check For A Download Or Leave Page Prompt")
-                chrome_relaunch = False
+            try:
+                say("Quitting Chrome")
+                if quit_chrome():
+                    relaunch_chrome(report, snapshot)
+                else:
+                    report.warn("Chrome Did Not Quit, Check For A Download Or Leave Page Prompt")
+            except Failure as error:
+                report.warn(f"Chrome: {error}")
         finish_vscode_update(report, before, vscode_target)
         update_claude(report, profiles)
         ensure_helper(profiles)
     except Failure as error:
         report.warn(str(error))
     finally:
-        try:
-            if chrome_relaunch:
-                say("Relaunching Chrome")
-                run(["/usr/bin/open", "-a", CHROME, "--args", "--restore-last-session"], check=True)
-                _, disk = chrome_versions()
-                report.ok(f"Chrome Updated To {disk}")
-                check_chrome_spaces(report, snapshot)
-        finally:
-            if vscode_was_running:
-                restore_windows(report, snapshot)
+        if vscode_was_running:
+            restore_windows(report, snapshot)
+        # A quit held up by a prompt can finish while VS Code was being restored.
+        if chrome_relaunch and not running(CHROME_BINARY) and not any("Chrome Updated" in l for l in report.lines):
+            try:
+                relaunch_chrome(report, snapshot)
+            except Failure as error:
+                report.warn(f"Chrome: {error}")
 
 
 # ---------------------------------------------------------------- front end
@@ -814,8 +869,10 @@ def busy_claude_sessions(seconds=90):
 def plan_lines(snapshot):
     lines = []
     current, commit = vscode_version()
-    latest = vscode_latest(commit) if commit else None
-    if latest and version_key(latest) > version_key(current):
+    latest = vscode_latest(commit) if commit else CHECK_FAILED
+    if latest == CHECK_FAILED:
+        lines.append(f"VS Code {current}: update check failed, uses whatever VS Code has downloaded")
+    elif latest and version_key(latest) > version_key(current):
         staged = " (downloaded)" if shipit_pending() == latest else ""
         lines.append(f"VS Code {current} -> {latest}{staged}")
     else:
@@ -824,7 +881,12 @@ def plan_lines(snapshot):
     for profile in profiles_of(snapshot):
         version = installed_extensions(profile).get(CLAUDE_EXT)
         if version:
-            arrow = f" -> {newest}" if newest and version_key(newest) > version_key(version) else " is current"
+            if not newest:
+                arrow = ": update check failed, updates to the latest anyway"
+            elif version_key(newest) > version_key(version):
+                arrow = f" -> {newest}"
+            else:
+                arrow = " is current"
             lines.append(f"Claude Code ({profile}) {version}{arrow}")
     started, disk = chrome_versions()
     if chrome_update_ready():
@@ -844,7 +906,6 @@ def prepare():
     ensure_spacectl()
     preflight_spaceman()
     snapshot = take_snapshot()
-    write_json(SNAPSHOT, snapshot)
     ensure_helper(profiles_of(snapshot))
     build_app()
     return snapshot
@@ -870,7 +931,12 @@ def cmd_update(args):
         if input("Go ahead? [y/N] ").strip().lower() not in ("y", "yes"):
             print("Nothing changed.")
             return
-    write_json(HANDOFF, {"mode": "update", "snapshot": snapshot, "at": time.time()})
+    fresh = take_snapshot()
+    if [w["path"] for w in fresh["windows"]] != [w["path"] for w in snapshot["windows"]]:
+        print("Windows changed while waiting; using the current ones:")
+        print("\n".join(describe_snapshot(fresh)))
+    write_json(SNAPSHOT, fresh)
+    write_json(HANDOFF, {"mode": "update", "snapshot": fresh, "at": time.time()})
     run(["/usr/bin/open", "-a", APP], check=True)
     print(f"Update is running. A notification says when it is done. Log: {LOGS}")
 
@@ -883,8 +949,11 @@ def cmd_app():
     if job and time.time() - job.get("at", 0) > HANDOFF_MAX_AGE:
         job = None
     if not job:
-        choice = ask("Update Chrome, VS Code and Claude Code, then reopen every window on its Space?",
-                     ["Cancel", "Update"], "Update")
+        question = "Update Chrome, VS Code and Claude Code, then reopen every window on its Space?"
+        busy = busy_claude_sessions()
+        if busy:
+            question += "\n\nClaude chats still working (quitting VS Code stops them):\n" + "\n".join(busy)
+        choice = ask(question, ["Cancel", "Update"], "Update")
         if choice != "Update":
             return
         try:
@@ -892,7 +961,9 @@ def cmd_app():
             if not spacectl("windows", VSCODE_ID)["titlesVisible"]:
                 run([SPACECTL, "request-capture"], timeout=10)
                 raise Failure("Allow Update under Screen Recording, then open it again")
-            job = {"mode": "update", "snapshot": prepare()}
+            snapshot = prepare()
+            write_json(SNAPSHOT, snapshot)
+            job = {"mode": "update", "snapshot": snapshot}
         except Failure as error:
             notify("Update Needs A Look", [str(error)])
             return

@@ -186,8 +186,8 @@ def active_space():
     return spacectl("active")
 
 
-def spaceman_names():
-    """{ManagedSpaceID: name} from Spaceman's saved names."""
+def spaceman_store():
+    """{ManagedSpaceID: Spaceman's saved info (spaceName, colorHex, ...)}."""
     result = run(["/usr/bin/defaults", "export", SPACEMAN_ID, "-"], binary=True)
     if result.returncode != 0:
         return {}
@@ -196,7 +196,11 @@ def spaceman_names():
         stored = plistlib.loads(prefs.get("spaceNames", b""))
     except (plistlib.InvalidFileException, ValueError, TypeError):
         return {}
-    return {str(key): (info or {}).get("spaceName", "") for key, info in stored.items()}
+    return {str(key): info or {} for key, info in stored.items()}
+
+
+def spaceman_names():
+    return {key: info.get("spaceName", "") for key, info in spaceman_store().items()}
 
 
 def current_spaces():
@@ -866,34 +870,102 @@ def busy_claude_sessions(seconds=90):
     return sorted(busy)
 
 
-def plan_lines(snapshot):
-    lines = []
+def plan_rows(snapshot):
+    """(app, current version, new version or None, note) for each thing update will touch."""
+    rows = []
     current, commit = vscode_version()
     latest = vscode_latest(commit) if commit else CHECK_FAILED
     if latest == CHECK_FAILED:
-        lines.append(f"VS Code {current}: update check failed, uses whatever VS Code has downloaded")
+        rows.append(("VS Code", current, None, "Check Failed"))
     elif latest and version_key(latest) > version_key(current):
-        staged = " (downloaded)" if shipit_pending() == latest else ""
-        lines.append(f"VS Code {current} -> {latest}{staged}")
+        rows.append(("VS Code", current, latest, "Downloaded" if shipit_pending() == latest else ""))
     else:
-        lines.append(f"VS Code {current} is current")
+        rows.append(("VS Code", current, None, "Up To Date"))
     newest = claude_latest()
     for profile in profiles_of(snapshot):
         version = installed_extensions(profile).get(CLAUDE_EXT)
-        if version:
-            if not newest:
-                arrow = ": update check failed, updates to the latest anyway"
-            elif version_key(newest) > version_key(version):
-                arrow = f" -> {newest}"
-            else:
-                arrow = " is current"
-            lines.append(f"Claude Code ({profile}) {version}{arrow}")
+        if not version:
+            continue
+        if not newest:
+            rows.append(("Claude Code", version, None, "Check Failed"))
+        elif version_key(newest) > version_key(version):
+            rows.append(("Claude Code", version, newest, ""))
+        else:
+            rows.append(("Claude Code", version, None, "Up To Date"))
     started, disk = chrome_versions()
     if chrome_update_ready():
-        lines.append(f"Chrome {started} -> {disk} (downloaded)")
+        rows.append(("Chrome", started, disk, "Downloaded"))
     else:
-        lines.append(f"Chrome {disk}: asks Chrome's updater, relaunches only if there is an update")
-    return lines
+        rows.append(("Chrome", disk, None, "Checks On Run"))
+    return rows
+
+
+# ---------------------------------------------------------------- terminal output
+
+COLOR = sys.stdout.isatty() and not os.environ.get("NO_COLOR")
+BOLD, DIM, GREEN, YELLOW, CYAN = "1", "2", "32", "33", "36"
+
+
+def paint(text, *codes):
+    return f"\033[{';'.join(codes)}m{text}\033[0m" if COLOR and codes else text
+
+
+def chip(space, width):
+    """A Space name drawn like its Spaceman menu bar chip: its own color behind white text."""
+    label = f" {space_label(space):<{width}} "
+    color = (spaceman_store().get(str(space.get("id"))) or {}).get("colorHex") or ""
+    if COLOR and re.fullmatch(r"[0-9A-Fa-f]{6}([0-9A-Fa-f]{2})?", color):
+        red, green, blue = (int(color[i:i + 2], 16) for i in (0, 2, 4))
+        return paint(label, BOLD, "97", f"48;2;{red};{green};{blue}")
+    return paint(label, BOLD)
+
+
+def heading(text):
+    return paint(text, BOLD, CYAN)
+
+
+def show_plan(snapshot, rows, busy):
+    print()
+    print(heading("Windows To Reopen"))
+    windows = snapshot["windows"]
+    width = max((len(space_label(w["space"])) for w in windows), default=0)
+    for window in windows:
+        print(f"  {chip(window['space'], width)}  {paint(Path(window['path']).name, BOLD)}")
+    if not windows:
+        print(f"  {paint('No VS Code Windows', DIM)}")
+    for title in snapshot["unmatched"]:
+        print(f"  {paint('Not Reopened', YELLOW)}  {title}")
+    print()
+    print(heading("Updates"))
+    version_width = max((len(current) for _, current, new, _ in rows if new), default=0)
+    for app, current, new, note in rows:
+        if new:
+            line = (f"  {app:<12} {paint(f'{current:<{version_width}}', DIM)}  {paint('→', DIM)}  "
+                    f"{paint(new, BOLD, GREEN)}")
+        else:
+            line = f"  {app:<12} {current}"
+        if note == "Up To Date":
+            line += f"  {paint('✓ Up To Date', GREEN)}"
+        elif note == "Check Failed":
+            line += f"  {paint('Update Check Failed', YELLOW)}"
+        elif note:
+            line += f"  {paint(note, DIM)}"
+        print(line)
+    if busy:
+        print()
+        print(paint("⚠  Claude Chats Still Working", BOLD, YELLOW))
+        for name in busy:
+            print(f"  {name}  {paint('Stops When VS Code Quits', DIM)}")
+    print()
+
+
+def short_project(transcript_dir, snapshot):
+    """A Claude project folder name ('github-home-assistant') as the folder it is ('home-assistant')."""
+    for window in snapshot["windows"]:
+        name = Path(window["path"]).name
+        if transcript_dir == name or transcript_dir.endswith("-" + name):
+            return name
+    return transcript_dir
 
 
 def profiles_of(snapshot):
@@ -914,31 +986,29 @@ def prepare():
 def cmd_update(args):
     if running_app():
         raise Failure("Update is already running")
+    print(paint("Checking Windows And Updates…", DIM))
     snapshot = prepare()
-    print("Windows to reopen:")
-    print("\n".join(describe_snapshot(snapshot)) or "  (no VS Code windows)")
-    print("Updates:")
-    for line in plan_lines(snapshot):
-        print(f"  {line}")
-    busy = busy_claude_sessions()
-    if busy:
-        print("Claude chats active in the last 90s (quitting VS Code stops them):")
-        for name in busy:
-            print(f"  {name}")
+    busy = [short_project(name, snapshot) for name in busy_claude_sessions()]
+    show_plan(snapshot, plan_rows(snapshot), busy)
     if not args.yes:
         if not sys.stdin.isatty():
             raise Failure("No terminal to confirm in; rerun with --yes")
-        if input("Go ahead? [y/N] ").strip().lower() not in ("y", "yes"):
-            print("Nothing changed.")
+        answer = input(f"{paint('Go Ahead?', BOLD)} {paint('[y/N]', DIM)} ").strip().lower()
+        if answer not in ("y", "yes"):
+            print(paint("Nothing Changed", DIM))
             return
     fresh = take_snapshot()
     if [w["path"] for w in fresh["windows"]] != [w["path"] for w in snapshot["windows"]]:
-        print("Windows changed while waiting; using the current ones:")
-        print("\n".join(describe_snapshot(fresh)))
+        print(paint("Windows Changed While Waiting, Using These", YELLOW))
+        show_plan(fresh, [], [])
     write_json(SNAPSHOT, fresh)
     write_json(HANDOFF, {"mode": "update", "snapshot": fresh, "at": time.time()})
     run(["/usr/bin/open", "-a", APP], check=True)
-    print(f"Update is running. A notification says when it is done. Log: {LOGS}")
+    print()
+    print(paint("✓ Update Is Running", BOLD, GREEN))
+    print("  VS Code And Chrome Close Now And Come Back On Their Spaces")
+    print("  A Notification Says When It Is Done")
+    print(f"  {paint('Log', DIM)}  {paint(str(LOGS / 'update.log'), DIM)}")
 
 
 def cmd_app():

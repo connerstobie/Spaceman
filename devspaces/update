@@ -67,6 +67,12 @@ SKIP_PROFILES = {"Work"}  # a different Mac's setup; update never installs or up
 VSCE = "@vscode/vsce@4.0.0"
 TITLE_SEP = " — "  # VS Code joins window title parts with an em dash
 HANDOFF_MAX_AGE = 120
+DEVTOOLS_PREFS = HOME / "Library/Application Support/Code/Partitions/vscode-browser/Preferences"
+PHONE = STATE / "phone.json"  # the DevTools phone size to come back at; default is the user's 372 x 711
+RESULT_TITLE = STATE / "result-title.txt"  # Update.app shows these as its own notification
+RESULT_BODY = STATE / "result-body.txt"
+CLEAN_ENV = ["/usr/bin/env", "-i", f"HOME={HOME}", f"USER={os.environ.get('USER', '')}",
+             f"LOGNAME={os.environ.get('USER', '')}", "PATH=/usr/bin:/bin:/usr/sbin:/sbin"]
 
 SCREEN_RECORDING_HELP = (
     "Window titles are hidden, so update cannot tell which folder each window shows. "
@@ -677,7 +683,7 @@ def open_window(window, space_id):
     """Open one folder in a new VS Code window on the Space now showing; returns the new window."""
     before = {w["id"] for w in spacectl("windows", VSCODE_ID)["windows"]}
     if not running(VSCODE_BINARY):
-        run(["/usr/bin/open", "-a", VSCODE, "--args", "--new-window", window["path"]], check=True)
+        run(CLEAN_ENV + ["/usr/bin/open", "-a", VSCODE, "--args", "--new-window", window["path"]], check=True)
     else:
         answer = request("open", 45, path=window["path"])
         if not answer or not answer.get("ok"):
@@ -749,7 +755,7 @@ def restore_windows(report, snapshot, skip=()):
         say(f"Could not switch back: {error}")
     if snapshot["windows"] and not running(VSCODE_BINARY):
         report.warn("Windows Did Not Reopen, VS Code Restored Them On One Space")
-        run(["/usr/bin/open", "-a", VSCODE])
+        run(CLEAN_ENV + ["/usr/bin/open", "-a", VSCODE])
     if landed:
         report.ok(f"{landed} Window{'s' if landed != 1 else ''} Back On {'Their' if landed != 1 else 'Its'} Space")
     for line in misplaced:
@@ -785,6 +791,8 @@ def run_job(job):
             notify("Update", ["Already Running"])
             return
         report = Report()
+        for stale in (RESULT_TITLE, RESULT_BODY):
+            stale.unlink(missing_ok=True)
         snapshot = job["snapshot"]
         say(f"Job: update, {len(snapshot['windows'])} VS Code windows")
         try:
@@ -797,8 +805,32 @@ def run_job(job):
             raise
         finally:
             title = "Update Done" if not report.problems else "Update Needs A Look"
-            notify(title, ["⚠️ " + p for p in report.problems] + ["✅ " + line for line in report.lines])
-            say("Finished")
+            lines = ["\u26a0\ufe0f " + p for p in report.problems] + ["\u2705 " + line for line in report.lines]
+            RESULT_TITLE.write_text(title)
+            RESULT_BODY.write_text("\n".join(lines[:4]))
+            say("Finished: " + " | ".join(lines))
+
+
+def set_devtools_phone(report):
+    """DevTools keeps ONE device size for every browser tab and the last tab to close overwrites
+    it, so every window came back at a different size. Pin the phone size while VS Code is closed."""
+    phone = read_json(PHONE) or {"width": 372, "height": 711}
+    try:
+        prefs = json.loads(DEVTOOLS_PREFS.read_text())
+    except (OSError, ValueError):
+        return
+    devtools = prefs.setdefault("electron", {}).setdefault("devtools", {}).setdefault("preferences", {})
+    devtools.update({
+        "emulation.show-device-mode": "true",
+        "emulation.device-mode-value": json.dumps({"device": "", "orientation": "", "mode": ""}),
+        "emulation.device-width": str(int(phone["width"])),
+        "emulation.device-height": str(int(phone["height"])),
+        "emulation.device-scale": "1",
+    })
+    tmp = DEVTOOLS_PREFS.with_name(".Preferences.update.tmp")
+    tmp.write_text(json.dumps(prefs, separators=(",", ":")))
+    os.replace(tmp, DEVTOOLS_PREFS)
+    report.ok(f"DevTools Phone Size {phone['width']} \u00d7 {phone['height']}")
 
 
 def relaunch_chrome(report, snapshot):
@@ -806,7 +838,7 @@ def relaunch_chrome(report, snapshot):
         report.warn("Chrome Was Reopened By Hand, Tabs May Not Have Come Back")
         return
     say("Relaunching Chrome")
-    run(["/usr/bin/open", "-a", CHROME, "--args", "--restore-last-session"], check=True)
+    run(CLEAN_ENV + ["/usr/bin/open", "-a", CHROME, "--args", "--restore-last-session"], check=True)
     _, disk = chrome_versions()
     report.ok(f"Chrome Updated To {disk}")
     check_chrome_spaces(report, snapshot)
@@ -839,6 +871,7 @@ def do_update(report, job, snapshot):
             except Failure as error:
                 report.warn(f"Chrome: {error}")
         finish_vscode_update(report, before, vscode_target)
+        set_devtools_phone(report)
         update_claude(report, profiles)
         ensure_helper(profiles)
     except Failure as error:
@@ -1003,7 +1036,7 @@ def cmd_update(args):
         show_plan(fresh, [], [])
     write_json(SNAPSHOT, fresh)
     write_json(HANDOFF, {"mode": "update", "snapshot": fresh, "at": time.time()})
-    run(["/usr/bin/open", "-a", APP], check=True)
+    run(CLEAN_ENV + ["/usr/bin/open", "-a", APP], check=True)
     print()
     print(paint("✓ Update Is Running", BOLD, GREEN))
     print("  VS Code And Chrome Close Now And Come Back On Their Spaces")
@@ -1079,6 +1112,11 @@ APPLET_SOURCE = """on run
 \ton error errorText
 \t\tdisplay alert "Update" message errorText
 \tend try
+\ttry
+\t\tset noteTitle to read POSIX file {title} as \u00abclass utf8\u00bb
+\t\tset noteBody to read POSIX file {body} as \u00abclass utf8\u00bb
+\t\tdisplay notification noteBody with title noteTitle
+\tend try
 end run
 """
 
@@ -1087,7 +1125,8 @@ def build_app():
     """Build Update.app when missing or changed; a rebuild resets its macOS permissions."""
     LOGS.mkdir(parents=True, exist_ok=True)
     source = APPLET_SOURCE.format(
-        script=applescript_text(str(REPO / "update")), log=applescript_text(str(LOGS / "update.log")))
+        script=applescript_text(str(REPO / "update")), log=applescript_text(str(LOGS / "update.log")),
+        title=applescript_text(str(RESULT_TITLE)), body=applescript_text(str(RESULT_BODY)))
     stamp = STATE / "app.sha256"
     digest = hashlib.sha256(source.encode()).hexdigest()
     if APP.exists() and stamp.exists() and stamp.read_text().strip() == digest:

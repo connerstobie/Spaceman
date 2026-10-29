@@ -25,6 +25,7 @@ import subprocess
 import sys
 import tempfile
 import time
+import traceback
 import urllib.error
 import urllib.request
 import uuid
@@ -964,7 +965,10 @@ def run_job(job):
         except Exception as error:  # keep the user informed even on a bug
             report.warn(f"Stopped: {type(error).__name__}")
             say(f"Unexpected error: {error!r}")
-            raise
+            # The traceback goes to the log, never back to Update.app: an error there becomes a
+            # modal alert that nobody can click on a locked screen, and every later run then
+            # refuses as "already running". The notification below says it stopped.
+            traceback.print_exc(file=sys.stdout)
         finally:
             title, lines = write_result(report)
         if deferred:

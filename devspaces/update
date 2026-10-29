@@ -38,6 +38,7 @@ STATE = HOME / "Library/Application Support/devspaces"
 LOGS = HOME / "Library/Logs/devspaces"
 SPACECTL = STATE / "bin/spacectl"
 SNAPSHOT = STATE / "snapshot.json"
+OWED = STATE / "owed-spaces.json"  # {folder realpath: saved Space} for windows a run left elsewhere
 HANDOFF = STATE / "handoff.json"
 LOCK = STATE / "lock"
 REQUESTS = STATE / "requests"
@@ -379,6 +380,7 @@ def take_snapshot():
     targets = known_targets(storage)
     open_folders = {os.path.realpath(f) for f in live_helpers().values() if f}
     order = {s["id"]: index for index, s in enumerate(spaces)}
+    owed = read_json(OWED) or {}
     windows, unmatched = [], []
     for window in vscode_windows:
         target = match_title(window["title"], targets, open_folders)
@@ -389,12 +391,15 @@ def take_snapshot():
             title = "".join(c if c.isprintable() else "?" for c in (window["title"] or ""))
             unmatched.append(title or f"window {window['id']}")
             continue
+        # A window an earlier run could not put back sits on the wrong Space: its home is the
+        # one that run was asked for, never where it was left.
+        home = owed.get(os.path.realpath(target["path"]))
         windows.append({
             "path": target["path"],
             "kind": target["kind"],
             "uri": target["uri"],
             "profile": profile_name(storage, target["uri"]),
-            "space": {"id": space["id"], "name": space["name"]},
+            "space": home if isinstance(home, dict) and home.get("name") else {"id": space["id"], "name": space["name"]},
         })
     # Space order, with the Space the user is on last so the run ends there.
     windows.sort(key=lambda w: (w["space"]["id"] == active, order.get(w["space"]["id"], 99)))
@@ -760,12 +765,15 @@ def restore_windows(report, snapshot, skip=()):
                 report.warn(f"{name} Did Not Open")
                 continue
             if space and space["id"] not in opened["spaces"]:
+                owe(real, window["space"])
                 if locked:
                     deferred.append(window)
                 else:
                     here = next((s for s in spaces if s["id"] in opened["spaces"]), None)
                     misplaced.append(f"{name} Landed On {space_label(here or {})}")
             else:
+                if space:
+                    settle(real)
                 landed += 1
             restore_devtools(window, browser)
         except Failure as error:
@@ -796,6 +804,19 @@ def restore_windows(report, snapshot, skip=()):
 # a snapshot from here, so a process carrying it is a command a Claude chat started.
 CLAUDE_COMMAND_MARK = "/.claude/shell-snapshots/"
 UNLOCK_WAIT = 12 * 3600  # how long Update.app waits for an unlock before leaving windows where they are
+
+
+def owe(real, space):
+    """Remember that a window is not on its Space yet, so the next snapshot keeps its real home."""
+    owed = read_json(OWED) or {}
+    owed[real] = {"id": space.get("id"), "name": space.get("name")}
+    write_json(OWED, owed)
+
+
+def settle(real):
+    owed = read_json(OWED) or {}
+    if owed.pop(real, None) is not None:
+        write_json(OWED, owed)
 
 
 def claude_project(path):
@@ -892,6 +913,7 @@ def move_window(report, window, spaces):
             here = next((s for s in spaces if s["id"] in opened["spaces"]), None)
             report.warn(f"{name} Landed On {space_label(here or {})}")
             return 0
+        settle(real)
         return 1
     except Failure as error:
         report.warn(f"{name}: {error}")

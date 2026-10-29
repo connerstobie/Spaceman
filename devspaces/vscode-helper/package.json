@@ -2,7 +2,7 @@
   "name": "devspaces-helper",
   "displayName": "Devspaces Helper",
   "description": "Opens folders in new windows, quits, or checks for updates when the local devspaces script asks, so new windows land on the macOS Space the script is showing.",
-  "version": "1.0.1",
+  "version": "1.0.2",
   "publisher": "connerstobie",
   "license": "MIT",
   "private": true,

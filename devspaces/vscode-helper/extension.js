@@ -134,6 +134,11 @@ async function perform(request) {
             if (request.folder === undefined) {
                 throw new Error('Close needs a folder.');
             }
+            // A window with unsaved files would stop on VS Code's save prompt and close later,
+            // after update gave up on it, and never be reopened. Refuse instead.
+            if (vscode.workspace.textDocuments.some((document) => document.isDirty)) {
+                throw new Error('Unsaved files.');
+            }
             log.appendLine('Closing this window.');
             respond(request.id, true);
             await vscode.commands.executeCommand('workbench.action.closeWindow');

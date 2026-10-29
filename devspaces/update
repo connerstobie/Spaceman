@@ -244,6 +244,17 @@ def switch_to(space_id):
     return False
 
 
+def screen_locked():
+    """True while the screen is locked. Spaces cannot be switched then: the switch gesture is
+    posted but macOS ignores it, so every window would open on the Space already showing."""
+    try:
+        result = run(["/usr/sbin/ioreg", "-n", "Root", "-d1", "-a"], timeout=10, binary=True)
+        users = plistlib.loads(result.stdout).get("IOConsoleUsers") or []
+    except (Failure, plistlib.InvalidFileException, ValueError, AttributeError):
+        return False
+    return any(user.get("CGSSessionScreenIsLocked") for user in users if user.get("kCGSSessionOnConsoleKey"))
+
+
 def space_label(space):
     return space.get("name") or f"Space {space.get('id')}"
 
@@ -714,10 +725,17 @@ def restore_devtools(window, browser):
 
 def restore_windows(report, snapshot, skip=()):
     """Reopen every snapshot window on its Space. One window's trouble never stops the rest,
-    and if VS Code is still closed at the end it is opened bare so its own restore runs."""
+    and if VS Code is still closed at the end it is opened bare so its own restore runs.
+
+    With the screen locked no Space can be switched to, so every window opens on the one showing
+    (still opened at once: a window can run work that must not wait for him to come back).
+    Those windows are returned, and place_after_unlock moves them once the screen unlocks."""
     _, spaces = current_spaces()
     start = active_space()
-    landed, misplaced = 0, []
+    locked = screen_locked()
+    if locked:
+        say("Screen locked: windows open on this Space and move to their own once it unlocks")
+    landed, misplaced, deferred = 0, [], []
     for window in snapshot["windows"]:
         name = Path(window["path"]).name
         try:
@@ -730,7 +748,7 @@ def restore_windows(report, snapshot, skip=()):
             space = resolve_space(window["space"], spaces)
             if not space:
                 report.warn(f"{space_label(window['space'])} Space Is Gone, {name} Opened Here")
-            elif not switch_to(space["id"]):
+            elif not locked and not switch_to(space["id"]):
                 report.warn(f"Could Not Switch To {space_label(space)}")
             browser = editor_state(window["uri"]) if window["kind"] == "folder" else None
             say(f"Opening {name} on {space_label(space or window['space'])}")
@@ -739,8 +757,11 @@ def restore_windows(report, snapshot, skip=()):
                 report.warn(f"{name} Did Not Open")
                 continue
             if space and space["id"] not in opened["spaces"]:
-                here = next((s for s in spaces if s["id"] in opened["spaces"]), None)
-                misplaced.append(f"{name} Landed On {space_label(here or {})}")
+                if locked:
+                    deferred.append(window)
+                else:
+                    here = next((s for s in spaces if s["id"] in opened["spaces"]), None)
+                    misplaced.append(f"{name} Landed On {space_label(here or {})}")
             else:
                 landed += 1
             restore_devtools(window, browser)
@@ -748,11 +769,12 @@ def restore_windows(report, snapshot, skip=()):
             report.warn(f"{name}: {error}")
     for title in snapshot.get("unmatched") or []:
         report.warn(f"Not Reopened: {title}")
-    try:
-        final = resolve_space(snapshot["active"], spaces)
-        switch_to(final["id"] if final else start)
-    except Failure as error:
-        say(f"Could not switch back: {error}")
+    if not locked:
+        try:
+            final = resolve_space(snapshot["active"], spaces)
+            switch_to(final["id"] if final else start)
+        except Failure as error:
+            say(f"Could not switch back: {error}")
     if snapshot["windows"] and not running(VSCODE_BINARY):
         report.warn("Windows Did Not Reopen, VS Code Restored Them On One Space")
         run(CLEAN_ENV + ["/usr/bin/open", "-a", VSCODE])
@@ -760,6 +782,143 @@ def restore_windows(report, snapshot, skip=()):
         report.ok(f"{landed} Window{'s' if landed != 1 else ''} Back On {'Their' if landed != 1 else 'Its'} Space")
     for line in misplaced:
         report.warn(line)
+    if deferred:
+        count = len(deferred)
+        report.warn(f"Screen Locked: {count} Window{'s' if count != 1 else ''} Move To "
+                    f"{'Their Spaces' if count != 1 else 'Its Space'} When It Unlocks")
+    return deferred
+
+
+# Claude Code's Bash tool runs every command (background tasks too) through a shell that sources
+# a snapshot from here, so a process carrying it is a command a Claude chat started.
+CLAUDE_COMMAND_MARK = "/.claude/shell-snapshots/"
+UNLOCK_WAIT = 12 * 3600  # how long Update.app waits for an unlock before leaving windows where they are
+
+
+def claude_project(path):
+    """The folder Claude Code keeps a folder's chats in."""
+    return HOME / ".claude/projects" / re.sub(r"[^A-Za-z0-9]", "-", os.path.realpath(path))
+
+
+def claude_commands_under(root_pid):
+    """True when a Claude chat under this process (a window's extension host) has a command running."""
+    listing = run(["/bin/ps", "-axo", "pid=,ppid=,command="], timeout=10).stdout
+    children, commands = {}, {}
+    for line in listing.splitlines():
+        parts = line.split(None, 2)
+        if len(parts) < 2 or not parts[0].isdigit() or not parts[1].isdigit():
+            continue
+        children.setdefault(int(parts[1]), []).append(int(parts[0]))
+        commands[int(parts[0])] = parts[2] if len(parts) > 2 else ""
+    stack, seen = list(children.get(root_pid, [])), set()
+    while stack:
+        pid = stack.pop()
+        if pid in seen:
+            continue
+        seen.add(pid)
+        if CLAUDE_COMMAND_MARK in commands.get(pid, ""):
+            return True
+        stack.extend(children.get(pid, []))
+    return False
+
+
+def window_busy(path, helper_pid, seconds=90):
+    """A window whose Claude chat wrote in the last 90 seconds, or has a command (or background
+    task) running. Closing such a window stops that work."""
+    now = time.time()
+    try:
+        if any(now - t.stat().st_mtime < seconds for t in claude_project(path).glob("*.jsonl")):
+            return True
+    except OSError:
+        pass
+    return claude_commands_under(helper_pid)
+
+
+def windows_with_tasks():
+    """Names of open windows with a Claude command or background task running (quitting stops it)."""
+    names = set()
+    for pid, folder in live_helpers().items():
+        try:
+            if folder and claude_commands_under(pid):
+                names.add(Path(folder).name)
+        except Failure:
+            continue
+    return sorted(names)
+
+
+def helper_pid_for(real):
+    return next((pid for pid, folder in live_helpers().items()
+                 if folder and os.path.realpath(folder) == real), None)
+
+
+def move_window(report, window, spaces):
+    """Close one open window and reopen it on its own Space. Returns 1 when it got there."""
+    name = Path(window["path"]).name
+    real = os.path.realpath(window["path"])
+    try:
+        space = resolve_space(window["space"], spaces)
+        if not space:
+            report.warn(f"{space_label(window['space'])} Space Is Gone, {name} Stays Here")
+            return 0
+        pid = helper_pid_for(real)
+        if pid is None:
+            say(f"{name} was closed after the update; nothing to move")
+            return 0
+        if window_busy(real, pid):
+            report.warn(f"{name} Stays Here While Its Claude Chat Or Task Runs")
+            return 0
+        browser = editor_state(window["uri"]) if window["kind"] == "folder" else None
+        answer = request("close", 30, folder=real)
+        if not answer or not answer.get("ok"):
+            report.warn(f"{name} Did Not Close So It Stays Here")
+            say(f"Close refused in {name}: {(answer or {}).get('error')}")
+            return 0
+        if not wait_for(lambda: pid not in live_helpers(), 30, 0.5):
+            report.warn(f"{name} Did Not Close So It Stays Here")
+            return 0
+        # From here the window is closed: every path reopens it, on the wrong Space if it must.
+        if not switch_to(space["id"]):
+            report.warn(f"Could Not Switch To {space_label(space)}")
+        say(f"Moving {name} to {space_label(space)}")
+        opened = open_window(window, space["id"])
+        if not opened:
+            report.warn(f"{name} Did Not Reopen")
+            return 0
+        restore_devtools(window, browser)
+        if space["id"] not in opened["spaces"]:
+            here = next((s for s in spaces if s["id"] in opened["spaces"]), None)
+            report.warn(f"{name} Landed On {space_label(here or {})}")
+            return 0
+        return 1
+    except Failure as error:
+        report.warn(f"{name}: {error}")
+        return 0
+
+
+def place_after_unlock(deferred):
+    """Move the windows opened while the screen was locked onto their own Spaces once it unlocks.
+    Runs inside Update.app after the update's own result, which was already shown."""
+    report = Report()
+    say(f"Waiting up to {UNLOCK_WAIT // 3600} hours for the screen to unlock")
+    wait_for(lambda: not screen_locked() or not running(VSCODE_BINARY), UNLOCK_WAIT, 5)
+    if not running(VSCODE_BINARY):
+        say("VS Code quit while waiting; nothing to move")
+        return
+    if screen_locked():
+        report.warn("Screen Stayed Locked So Windows Stayed Put")
+    else:
+        time.sleep(3)  # let the desktop settle after unlocking
+        try:
+            _, spaces = current_spaces()
+            start = active_space()
+            moved = sum(move_window(report, window, spaces) for window in deferred)
+            switch_to(start)
+            if moved:
+                report.ok(f"{moved} Window{'s' if moved != 1 else ''} Moved To "
+                          f"{'Their Spaces' if moved != 1 else 'Its Space'}")
+        except Failure as error:
+            report.warn(str(error))
+    write_result(report)
 
 
 def check_chrome_spaces(report, snapshot):
@@ -795,8 +954,9 @@ def run_job(job):
             stale.unlink(missing_ok=True)
         snapshot = job["snapshot"]
         say(f"Job: update, {len(snapshot['windows'])} VS Code windows")
+        deferred = []
         try:
-            do_update(report, job, snapshot)
+            deferred = do_update(report, job, snapshot) or []
         except Failure as error:
             report.warn(str(error))
         except Exception as error:  # keep the user informed even on a bug
@@ -804,11 +964,21 @@ def run_job(job):
             say(f"Unexpected error: {error!r}")
             raise
         finally:
-            title = "Update Done" if not report.problems else "Update Needs A Look"
-            lines = ["\u26a0\ufe0f " + p for p in report.problems] + ["\u2705 " + line for line in report.lines]
-            RESULT_TITLE.write_text(title)
-            RESULT_BODY.write_text("\n".join(lines[:4]))
-            say("Finished: " + " | ".join(lines))
+            title, lines = write_result(report)
+        if deferred:
+            # The update is done: say so now, not hours later when the screen unlocks.
+            notify(title, lines)
+            place_after_unlock(deferred)
+
+
+def write_result(report):
+    """Hand Update.app the notification it shows when the job ends; returns (title, lines)."""
+    title = "Update Done" if not report.problems else "Update Needs A Look"
+    lines = ["\u26a0\ufe0f " + p for p in report.problems] + ["\u2705 " + line for line in report.lines]
+    RESULT_TITLE.write_text(title)
+    RESULT_BODY.write_text("\n".join(lines[:4]))
+    say("Finished: " + " | ".join(lines))
+    return title, lines
 
 
 def set_devtools_phone(report):
@@ -845,6 +1015,8 @@ def relaunch_chrome(report, snapshot):
 
 
 def do_update(report, job, snapshot):
+    """Returns the windows that opened on the wrong Space because the screen was locked."""
+    deferred = []
     profiles = profiles_of(snapshot)
     vscode_was_running = running(VSCODE_BINARY)
     preflight_permissions()  # before anything quits: the first run's permission prompts show here
@@ -857,8 +1029,7 @@ def do_update(report, job, snapshot):
         if not quit_vscode():
             still_open = {os.path.realpath(f) for f in live_helpers().values() if f}
             report.warn("VS Code Did Not Quit, Updates Skipped")
-            restore_windows(report, snapshot, skip=still_open)
-            return
+            return restore_windows(report, snapshot, skip=still_open)
     # From here on VS Code is closed: every path below ends by reopening its windows.
     try:
         if chrome_relaunch:
@@ -878,13 +1049,14 @@ def do_update(report, job, snapshot):
         report.warn(str(error))
     finally:
         if vscode_was_running:
-            restore_windows(report, snapshot)
+            deferred = restore_windows(report, snapshot)
         # A quit held up by a prompt can finish while VS Code was being restored.
         if chrome_relaunch and not running(CHROME_BINARY) and not any("Chrome Updated" in l for l in report.lines):
             try:
                 relaunch_chrome(report, snapshot)
             except Failure as error:
                 report.warn(f"Chrome: {error}")
+    return deferred
 
 
 # ---------------------------------------------------------------- front end
@@ -957,7 +1129,7 @@ def heading(text):
     return paint(text, BOLD, CYAN)
 
 
-def show_plan(snapshot, rows, busy):
+def show_plan(snapshot, rows, busy, tasks=()):
     print()
     print(heading("Windows To Reopen"))
     windows = snapshot["windows"]
@@ -988,6 +1160,11 @@ def show_plan(snapshot, rows, busy):
         print()
         print(paint("⚠  Claude Chats Still Working", BOLD, YELLOW))
         for name in busy:
+            print(f"  {name}  {paint('Stops When VS Code Quits', DIM)}")
+    if tasks:
+        print()
+        print(paint("⚠  Background Tasks Running", BOLD, YELLOW))
+        for name in tasks:
             print(f"  {name}  {paint('Stops When VS Code Quits', DIM)}")
     print()
 
@@ -1022,7 +1199,8 @@ def cmd_update(args):
     print(paint("Checking Windows And Updates…", DIM))
     snapshot = prepare()
     busy = [short_project(name, snapshot) for name in busy_claude_sessions()]
-    show_plan(snapshot, plan_rows(snapshot), busy)
+    tasks = windows_with_tasks()
+    show_plan(snapshot, plan_rows(snapshot), busy, tasks)
     if not args.yes:
         if not sys.stdin.isatty():
             raise Failure("No terminal to confirm in; rerun with --yes")
@@ -1056,6 +1234,9 @@ def cmd_app():
         busy = busy_claude_sessions()
         if busy:
             question += "\n\nClaude chats still working (quitting VS Code stops them):\n" + "\n".join(busy)
+        tasks = windows_with_tasks()
+        if tasks:
+            question += "\n\nBackground tasks running (quitting VS Code stops them):\n" + "\n".join(tasks)
         choice = ask(question, ["Cancel", "Update"], "Update")
         if choice != "Update":
             return

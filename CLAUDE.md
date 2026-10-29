@@ -216,7 +216,14 @@ the user's map lives in `~/Library/Application Support/devspaces/`).
   macOS setting off needs `killall Dock`, which is why it was not used.
 - **Protocol:** `update` writes `requests/<id>.json` (0700 dir); every window's helper sees it, one
   claims it by atomic rename, answers in `responses/<id>.json`. Requests with a `folder` are only
-  claimed by that folder's window. Types: `open`, `devtools`, `check-update`, `quit`, `close` (folder-targeted).
+  claimed by that folder's window. Types: `open`, `devtools`, `check-update`, `quit`, `close` (folder-targeted;
+  refused while the window has unsaved files).
+- **A locked screen cannot switch Spaces** (Spaceman posts the gesture, macOS ignores it). Windows still
+  reopen at once, on the Space showing; Update.app then waits (bounded) for the unlock and moves each to
+  its Space by close and reopen, never a window whose Claude chat wrote in the last 90 seconds or has a
+  command running under its extension host (a background task dies with its window).
+- **Updating always quits VS Code, whatever is running**: busy chats and background tasks are listed
+  as a warning, never a refusal.
 - **The work runs inside `~/Applications/Update.app`** (an osacompile applet that calls
   `update --app`), so VS Code quitting cannot kill it and it has its own macOS permissions (Automation for
   Spaceman and Chrome; Screen Recording only when started from Spotlight, for window titles).

@@ -93,9 +93,11 @@ def say(message):
 
 def run(cmd, timeout=60, check=False, binary=False, cwd=None):
     try:
+        # Tools print bytes that are not UTF-8 (GoogleUpdater's progress output did, and the
+        # strict decode stopped a whole update): never let output we only log end the job.
         result = subprocess.run(
-            [str(part) for part in cmd], capture_output=True, text=not binary, timeout=timeout,
-            stdin=subprocess.DEVNULL, cwd=cwd)
+            [str(part) for part in cmd], capture_output=True, timeout=timeout, stdin=subprocess.DEVNULL,
+            cwd=cwd, **({} if binary else {"encoding": "utf-8", "errors": "replace"}))
     except subprocess.TimeoutExpired:
         raise Failure(f"{Path(str(cmd[0])).name} did not finish within {timeout}s")
     except OSError as error:
